@@ -349,6 +349,20 @@ async function main() {
           }
         } catch (_mirrorDiagErr) { /* diagnostics must never block startup */ }
 
+        // RecallVerify diagnostic banner: parallel to HubMirror but reads its
+        // own env, since verification can run with HubMirror off (verifier
+        // events are local-only on first ship).
+        try {
+          const enabled = String(process.env.EVOLVE_RECALL_VERIFY || '1') !== '0';
+          const sampleRateRaw = Number(process.env.EVOLVE_RECALL_VERIFY_SAMPLE_RATE);
+          const sampleRate = Number.isFinite(sampleRateRaw) && sampleRateRaw >= 0 && sampleRateRaw <= 1 ? sampleRateRaw : 1.0;
+          if (!enabled) {
+            console.log('[RecallVerify] DISABLED — set EVOLVE_RECALL_VERIFY=1 to verify published assets round-trip via Hub Phase 2 lookup.');
+          } else {
+            console.log(`[RecallVerify] ENABLED — verifying published assets via Hub Phase 2 lookup, sample_rate=${sampleRate}. Set EVOLVE_RECALL_VERIFY=0 to disable.`);
+          }
+        } catch (_rvDiagErr) { /* diagnostics must never block startup */ }
+
         const { getEvolutionDir, getEvolverLogPath } = require('./src/gep/paths');
         const solidifyStatePath = path.join(getEvolutionDir(), 'evolution_solidify_state.json');
         const cycleProgressPath = path.join(getEvolutionDir(), 'cycle_progress.json');
@@ -396,6 +410,16 @@ async function main() {
           }
         } catch (e) {
           console.warn('[Heartbeat] Failed to start: ' + (e.message || e));
+        }
+
+        // RecallVerify worker: starts once per process; drains the publish-
+        // verification queue with backoff. unref'd so it never blocks exit.
+        try {
+          if (String(process.env.EVOLVE_RECALL_VERIFY || '1') !== '0') {
+            require('./src/gep/recallVerifier').startWorker();
+          }
+        } catch (rvStartErr) {
+          console.warn('[RecallVerify] startWorker failed: ' + (rvStartErr && rvStartErr.message || rvStartErr));
         }
 
         // Validator daemon: independent timer that fetches and executes

@@ -114,13 +114,22 @@ function aggregate(events) {
   const totalsDenom = totals.ok + totals.missing + totals.mismatch;
   totals.success_rate = totalsDenom > 0 ? totals.ok / totalsDenom : 0;
 
+  // Gate severity is monotonic: once a row triggers a worse state, later
+  // rows cannot downgrade it. Without this, AntiPattern@0% (RED) followed
+  // by Capsule@90% (YELLOW) would report YELLOW — misleading dashboards
+  // even though the exit code still reflects RED. (Bugbot review on PR #53.)
+  // RANK is the comparison ordinal: GREEN(0) < YELLOW(1) < RED(2).
+  const RANK = { GREEN: 0, YELLOW: 1, RED: 2 };
+  function escalate(current, candidate) {
+    return RANK[candidate] > RANK[current] ? candidate : current;
+  }
   let gate = 'GREEN';
   if (rows.length === 0) gate = 'RED';
   else {
     for (const r of rows) {
       if (r.mismatch > 0) { gate = 'RED'; break; }
       if (r.success_rate < SUCCESS_THRESHOLD) {
-        gate = r.success_rate >= 0.85 ? 'YELLOW' : 'RED';
+        gate = escalate(gate, r.success_rate >= 0.85 ? 'YELLOW' : 'RED');
       }
     }
   }
