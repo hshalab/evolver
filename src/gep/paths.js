@@ -205,8 +205,28 @@ function getReflectionLogPath() {
   return path.join(getEvolutionDir(), 'reflection_log.jsonl');
 }
 
+// Resolve the evolver INSTALLATION directory (the package containing this file),
+// independent of any host git repo or process.cwd().
+//
+// Use this — never getRepoRoot() — for any operation that mutates evolver's
+// own files (force-update, self-PR, integrity rewrites, etc.). getRepoRoot()
+// preferentially returns the user's surrounding project so that evolution
+// signals are scoped to *their* code; using it for self-mutation will
+// overwrite the user's project with evolver's package contents (issue #51).
+//
+// path.resolve(__dirname, '..', '..') is stable across all install modes:
+//   - global npm: /usr/lib/node_modules/@evomap/evolver/src/gep/paths.js
+//                 → /usr/lib/node_modules/@evomap/evolver
+//   - local install: <project>/node_modules/@evomap/evolver/src/gep/paths.js
+//                 → <project>/node_modules/@evomap/evolver
+//   - dev clone: /home/user/evolver/src/gep/paths.js → /home/user/evolver
+function getEvolverInstallRoot() {
+  return path.resolve(__dirname, '..', '..');
+}
+
 module.exports = {
   getRepoRoot,
+  getEvolverInstallRoot,
   getWorkspaceRoot,
   getLogsDir,
   getEvolverLogPath,
