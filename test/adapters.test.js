@@ -543,20 +543,30 @@ describe('hookAdapter', () => {
       // resolved as the trusted evolver root, letting the workspace control
       // findMemoryGraph() — which feeds attacker text into the
       // session-start `additionalContext` (prompt injection).
-      // The fix removed `process.cwd()` from the require.resolve paths;
-      // this test pins that property at the source level.
-      const runtimePathsSrc = fs.readFileSync(
-        path.resolve(__dirname, '..', 'src', 'adapters', 'scripts', '_runtimePaths.js'),
-        'utf8'
-      );
-      const requireResolveBlock = runtimePathsSrc.match(/require\.resolve\([^)]*\)/s);
-      assert.ok(requireResolveBlock, 'require.resolve call must exist');
-      // Allow process.cwd() to appear elsewhere in the file, but not in the
-      // paths array passed to require.resolve.
-      const pathsArray = runtimePathsSrc.match(/paths:\s*\[[^\]]*\]/s);
-      assert.ok(pathsArray, 'paths array must exist for require.resolve');
-      assert.ok(!/process\.cwd\(\)/.test(pathsArray[0]),
-        'process.cwd() must not appear in require.resolve paths — hostile workspace could hijack evolver root and inject prompt-injection content via memory graph');
+      // The fix removed `process.cwd()` from the require.resolve paths.
+      // The paths array is now built dynamically by
+      // _buildInstallSearchPaths() (so we can add Apple Silicon Homebrew
+      // / NVM / fnm / Volta / asdf without bloating the call site), so
+      // test the runtime invariant: the produced paths must never
+      // include process.cwd() or a node_modules directory under it.
+      const runtimePaths = require('../src/adapters/scripts/_runtimePaths');
+      const paths = runtimePaths.__internals.buildInstallSearchPaths();
+      const cwd = process.cwd();
+      const cwdNm = path.join(cwd, 'node_modules');
+      // The actual security invariant is "process.cwd() itself (or
+      // cwd/node_modules) must not appear in the allowlist". The
+      // tempting `p.startsWith(cwd + path.sep)` check is too broad —
+      // all user-scoped paths are rooted at os.homedir(), so the test
+      // would fire false positives whenever cwd === os.homedir() (user
+      // runs evolver from their home dir), cwd === '/home' (Linuxbrew
+      // path begins with /home/), or cwd === '/opt' (Apple Silicon
+      // Homebrew path begins with /opt/). Bugbot PR #165 Medium.
+      for (const p of paths) {
+        assert.notEqual(p, cwd,
+          'install search list MUST NOT include process.cwd() — hostile workspace could plant @evomap/evolver and hijack findMemoryGraph');
+        assert.notEqual(p, cwdNm,
+          'install search list MUST NOT include cwd/node_modules either');
+      }
     });
 
     it('findEvolverRoot ignores a hostile node_modules in cwd', () => {

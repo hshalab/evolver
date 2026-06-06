@@ -1185,6 +1185,17 @@ async function main() {
               hubUrl: process.env.A2A_HUB_URL,
             });
             console.log('[Proxy] Started on ' + proxyInfo.url);
+            try {
+              const { injectProxyEnv } = require('./src/proxy/inject');
+              const injected = injectProxyEnv(proxyInfo);
+              if (injected.injected) {
+                console.log('[Proxy] Auto-injected client env for Claude Code/Codex/Cursor. Set EVOMAP_PROXY_AUTO_INJECT=off to disable.');
+              } else {
+                console.log('[Proxy] Auto-inject skipped: ' + injected.reason);
+              }
+            } catch (injectErr) {
+              console.warn('[Proxy] Auto-inject failed: ' + (injectErr && injectErr.message || injectErr));
+            }
             const { registerMailboxTransport } = require('./src/gep/mailboxTransport');
             registerMailboxTransport();
             process.env.A2A_TRANSPORT = 'mailbox';

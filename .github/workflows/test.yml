@@ -1,0 +1,36 @@
+name: test
+
+# Runs the Node test suite on every PR and on pushes to main. Until now the
+# repo had no GitHub Actions workflow at all — PR checks were Cursor Bugbot +
+# Security only, neither of which runs `npm test`, so a green PR did NOT mean
+# the tests passed (e.g. #165 / #196 shipped test files that failed on POSIX
+# behind green checks). This makes "green" mean "tests pass" again.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # engines: node >=22.12
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests (node --test)
+        run: npm test

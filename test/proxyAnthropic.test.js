@@ -169,6 +169,68 @@ describe('EvoMapProxy._proxyAnthropic', () => {
     }
   });
 
+  it('uses preserved upstream auth token when proxy env was auto-injected', async () => {
+    captured.length = 0;
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    const prevTok = process.env.ANTHROPIC_AUTH_TOKEN;
+    const prevUpstreamTok = process.env.EVOMAP_ANTHROPIC_AUTH_TOKEN;
+    const prevInjected = process.env.EVOMAP_PROXY_AUTO_INJECTED;
+    delete process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_AUTH_TOKEN = 'proxy-token';
+    process.env.EVOMAP_ANTHROPIC_AUTH_TOKEN = 'sk-upstream-bearer';
+    process.env.EVOMAP_PROXY_AUTO_INJECTED = '1';
+    try {
+      const res = await proxy._proxyAnthropic('/v1/messages', { model: 'm' }, {
+        inboundHeaders: {},
+      });
+      assert.equal(res.status, 200);
+      assert.equal(captured.length, 1);
+      assert.equal(captured[0].headers['authorization'], 'Bearer sk-upstream-bearer');
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+      if (prevTok === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+      else process.env.ANTHROPIC_AUTH_TOKEN = prevTok;
+      if (prevUpstreamTok === undefined) delete process.env.EVOMAP_ANTHROPIC_AUTH_TOKEN;
+      else process.env.EVOMAP_ANTHROPIC_AUTH_TOKEN = prevUpstreamTok;
+      if (prevInjected === undefined) delete process.env.EVOMAP_PROXY_AUTO_INJECTED;
+      else process.env.EVOMAP_PROXY_AUTO_INJECTED = prevInjected;
+    }
+  });
+
+  it('uses preserved upstream base URL when proxy env was auto-injected', async () => {
+    const alternateCaptured = [];
+    const alternate = await startStub((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        alternateCaptured.push({ path: req.url, body: Buffer.concat(chunks).toString() });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'msg_alt' }));
+      });
+    });
+    captured.length = 0;
+    const prevBase = process.env.EVOMAP_ANTHROPIC_BASE_URL;
+    const prevInjected = process.env.EVOMAP_PROXY_AUTO_INJECTED;
+    process.env.EVOMAP_ANTHROPIC_BASE_URL = alternate.baseUrl;
+    process.env.EVOMAP_PROXY_AUTO_INJECTED = '1';
+    try {
+      const res = await proxy._proxyAnthropic('/v1/messages', { model: 'm' }, {
+        inboundHeaders: { 'x-api-key': 'sk' },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(captured.length, 0);
+      assert.equal(alternateCaptured.length, 1);
+      assert.equal(alternateCaptured[0].path, '/v1/messages');
+    } finally {
+      await new Promise((resolve) => alternate.server.close(resolve));
+      if (prevBase === undefined) delete process.env.EVOMAP_ANTHROPIC_BASE_URL;
+      else process.env.EVOMAP_ANTHROPIC_BASE_URL = prevBase;
+      if (prevInjected === undefined) delete process.env.EVOMAP_PROXY_AUTO_INJECTED;
+      else process.env.EVOMAP_PROXY_AUTO_INJECTED = prevInjected;
+    }
+  });
+
   it('does NOT substitute env creds when client already supplied x-api-key', async () => {
     captured.length = 0;
     const prevKey = process.env.ANTHROPIC_API_KEY;

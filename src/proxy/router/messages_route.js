@@ -18,6 +18,7 @@
 const { pickForTurn } = require('./model_router');
 const { rewriteModel } = require('./cache_passthrough');
 const { extractFeatures } = require('./features');
+const { createProxyTrace } = require('../trace/extractor');
 
 // Bedrock-resolvable global.* aliases as of 2026-05-25:
 //   - opus-4-7    : bare alias OK
@@ -96,7 +97,7 @@ function resolveTierModels() {
   };
 }
 
-function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
+function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStore } = {}) {
   if (typeof anthropicProxy !== 'function') {
     throw new Error('buildMessagesHandler requires anthropicProxy(path, body, opts)');
   }
@@ -152,7 +153,11 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
     const upstreamMode = (process.env.EVOMAP_UPSTREAM || 'anthropic').toLowerCase();
     if (upstreamMode !== 'bedrock') {
       const hasInboundKey = !!inboundHeaders['x-api-key'];
-      const hasProxyEnvCreds = !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
+      const hasProxyEnvCreds = !!(
+        process.env.ANTHROPIC_API_KEY
+        || process.env.EVOMAP_ANTHROPIC_AUTH_TOKEN
+        || (process.env.EVOMAP_PROXY_AUTO_INJECTED === '1' ? '' : process.env.ANTHROPIC_AUTH_TOKEN)
+      );
       if (!hasInboundKey && !hasProxyEnvCreds) {
         throw Object.assign(new Error('x-api-key required'), { statusCode: 401 });
       }
@@ -252,20 +257,48 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
       }));
     }
 
-    const upstream = await anthropicProxy('/v1/messages', outboundBody, {
-      inboundHeaders,
-      upstreamMode,
-    });
+    // Trace extraction is best-effort observability — it must never break the
+    // request. A throwing body accessor (e.g. the simulated classifier failure
+    // in routerFeatureFlag) would otherwise propagate out of createProxyTrace /
+    // extractCWD and 500 the call. Downstream uses `trace?.`, so null is safe.
+    let trace = null;
+    try {
+      trace = createProxyTrace({
+        route: 'POST /v1/messages',
+        headers: inboundHeaders,
+        body: outboundBody,
+        upstreamMode,
+        originalModel,
+        chosenModel,
+        store: traceStore,
+      });
+    } catch (_) { /* best-effort trace; never break the request */ }
+
+    let upstream;
+    try {
+      upstream = await anthropicProxy('/v1/messages', outboundBody, {
+        inboundHeaders,
+        upstreamMode,
+      });
+    } catch (err) {
+      trace?.record({ status: 502, error: err, upstreamMode, model: chosenModel });
+      throw err;
+    }
+
+    const recordStreamTrace = (result) => {
+      trace?.recordStreamStart({ status: result.status, upstreamMode, model: chosenModel, headers: result.headers });
+      return result;
+    };
 
     if (upstream.stream) {
       const forwardHeaders = {};
       const ct = upstream.headers && upstream.headers['content-type'];
       if (ct) forwardHeaders['Content-Type'] = ct;
-      return {
+      return recordStreamTrace({
         status: upstream.status,
         stream: upstream.stream,
         headers: forwardHeaders,
-      };
+      });
     }
 
     // First upstream returned non-stream. If it's a 5xx on a router-rewritten
@@ -277,6 +310,7 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
     // as JSON before any SSE flowed, so streaming the second attempt is
     // still safe). The result-shape branch below handles both cases.
     let finalUpstream = upstream;
+    let finalModel = chosenModel;
     if (
       enabled
       && upstream.status >= 500
@@ -348,6 +382,7 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
           inboundHeaders,
           upstreamMode,
         });
+        finalModel = originalModel;
       } catch (err) {
         // Replay the drained first response so the caller still sees the
         // original 503 + body, not an empty stream.
@@ -357,6 +392,7 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
           stream: null,
           text: () => drainedFirst,
         };
+        finalModel = chosenModel;
         log.warn?.(JSON.stringify({
           event: 'router_fallback',
           reason: 'upstream_5xx_retry_failed',
@@ -371,6 +407,12 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
       const forwardHeaders = {};
       const ct = finalUpstream.headers && finalUpstream.headers['content-type'];
       if (ct) forwardHeaders['Content-Type'] = ct;
+      trace?.recordStreamStart({
+        status: finalUpstream.status,
+        upstreamMode,
+        model: finalModel,
+        headers: forwardHeaders,
+      });
       return {
         status: finalUpstream.status,
         stream: finalUpstream.stream,
@@ -405,6 +447,13 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
         }));
       }
     }
+    trace?.record({
+      status: finalUpstream.status,
+      responseBody: respBody,
+      upstreamMode,
+      model: finalModel,
+      headers: finalUpstream.headers,
+    });
     return { status: finalUpstream.status, body: respBody };
   };
 }

@@ -170,6 +170,11 @@ const ENV_SCAN_SKIP_KEYS = new Set([
   'PAGER', 'LESS', 'LS_COLORS', 'COLORTERM', 'TERM_PROGRAM',
   'XDG_SESSION_ID', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
   'SSH_AUTH_SOCK', 'SSH_AGENT_PID', '_',
+  // Public CI identity — GitHub Actions sets these to usernames / org names,
+  // never secrets. Without skipping them, detectEnvValueLeaks flags any content
+  // that merely contains the actor's username (e.g. a commit-author noreply
+  // email) as an env-value leak: a false positive that fails only under CI.
+  'GITHUB_ACTOR', 'GITHUB_TRIGGERING_ACTOR', 'GITHUB_REPOSITORY_OWNER',
 ]);
 
 /**

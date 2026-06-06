@@ -136,9 +136,14 @@ const REPAIR_LOOP_THRESHOLD = envInt('EVOLVER_REPAIR_LOOP_THRESHOLD', 3);
 //
 // GENE_BAN_PER_KEY_ATTEMPTS:    minimum attempts on the same signal key
 // GENE_BAN_BEST_THRESHOLD:      best success rate at or below which the Gene is banned
+// GENE_INERT_BAN_STREAK:        consecutive inert (stable_no_error, zero-work) outcomes
+//                               on a signal key after which a Gene with no real
+//                               success is banned, so --loop selection explores
+//                               instead of re-running a do-nothing gene (#562)
 // GENE_EPIGENETIC_HARD_BOOST:   epigenetic boost at or below which the Gene is hard-suppressed
 const GENE_BAN_PER_KEY_ATTEMPTS = envInt('EVOLVER_GENE_BAN_PER_KEY_ATTEMPTS', 4);
 const GENE_BAN_BEST_THRESHOLD = envFloat('EVOLVER_GENE_BAN_BEST_THRESHOLD', 0.15);
+const GENE_INERT_BAN_STREAK = envInt('EVOLVER_GENE_INERT_BAN_STREAK', 8);
 const GENE_EPIGENETIC_HARD_BOOST = envFloat('EVOLVER_GENE_EPIGENETIC_HARD_BOOST', -0.3);
 const SESSION_ARCHIVE_TRIGGER = envInt('EVOLVER_SESSION_ARCHIVE_TRIGGER', 100);
 const SESSION_ARCHIVE_KEEP = envInt('EVOLVER_SESSION_ARCHIVE_KEEP', 50);
@@ -243,6 +248,7 @@ module.exports = {
   REPAIR_LOOP_THRESHOLD,
   GENE_BAN_PER_KEY_ATTEMPTS,
   GENE_BAN_BEST_THRESHOLD,
+  GENE_INERT_BAN_STREAK,
   GENE_EPIGENETIC_HARD_BOOST,
   SESSION_ARCHIVE_TRIGGER,
   SESSION_ARCHIVE_KEEP,

@@ -691,6 +691,7 @@ class LifecycleManager {
     try { this.store.setState('node_secret', ''); } catch { /* best-effort */ }
     // Clear the source tag too -- nothing is stored, nothing to attribute.
     try { this.store.setState('node_secret_source', ''); } catch { /* best-effort */ }
+    try { this.store.setState('node_secret_env_suppressed', 'true'); } catch { /* best-effort */ }
     // Suppress the env override for this process so _resolveNodeSecret stops
     // re-seeding the store with the same stale env value next call.
     this._suppressEnvSecret = true;

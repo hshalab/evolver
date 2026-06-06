@@ -11,6 +11,7 @@ const { TaskMonitor } = require('./task/monitor');
 const { SkillUpdater } = require('./extensions/skillUpdater');
 const { DmHandler } = require('./extensions/dmHandler');
 const { SessionHandler } = require('./extensions/sessionHandler');
+const { TraceControl } = require('./extensions/traceControl');
 
 // Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
 function _defaultDataDir() { return getEvomapPath('mailbox'); }
@@ -49,6 +50,7 @@ class EvoMapProxy {
     this.skillUpdater = null;
     this.dmHandler = null;
     this.sessionHandler = null;
+    this.traceControl = null;
     this._started = false;
   }
 
@@ -85,6 +87,14 @@ class EvoMapProxy {
       logger: this.logger,
     });
 
+    this.traceControl = new TraceControl({
+      store: this.store,
+      logger: this.logger,
+    });
+    try { this.traceControl.pollAndApply(); } catch (e) {
+      this.logger?.warn?.('[proxy] traceControl initial poll failed:', e.message);
+    }
+
     const getHeaders = () => this.lifecycle._buildHeaders();
     const taskMonitor = this.taskMonitor;
 
@@ -97,6 +107,9 @@ class EvoMapProxy {
       onInboundReceived: () => {
         try { this.skillUpdater?.pollAndApply(); } catch (e) {
           this.logger?.warn?.('[proxy] skillUpdater.pollAndApply failed:', e.message);
+        }
+        try { this.traceControl?.pollAndApply(); } catch (e) {
+          this.logger?.warn?.('[proxy] traceControl.pollAndApply failed:', e.message);
         }
       },
     });
@@ -134,6 +147,7 @@ class EvoMapProxy {
           : this._proxyAnthropic(reqPath, body, opts);
       },
       logger: this.logger,
+      traceStore: this.store,
     });
 
     const routes = buildRoutes(this.store, proxyHandlers, this.taskMonitor, {
@@ -304,7 +318,10 @@ class EvoMapProxy {
   // can be hot-swapped without restart, matching the EVOMAP_MODEL_*
   // policy in README.
   async _proxyAnthropic(reqPath, body, opts = {}) {
-    const baseUrl = (opts.baseUrl || this._anthropicBaseUrl || '').replace(/\/+$/, '');
+    const injectedUpstreamBaseUrl = process.env.EVOMAP_PROXY_AUTO_INJECTED === '1'
+      ? process.env.EVOMAP_ANTHROPIC_BASE_URL
+      : '';
+    const baseUrl = (opts.baseUrl || injectedUpstreamBaseUrl || this._anthropicBaseUrl || '').replace(/\/+$/, '');
     const inbound = opts.inboundHeaders || {};
     const timeoutMs = opts.timeoutMs || 60_000;
 
@@ -320,8 +337,12 @@ class EvoMapProxy {
     if (!fwd['x-api-key']) {
       if (process.env.ANTHROPIC_API_KEY) {
         fwd['x-api-key'] = process.env.ANTHROPIC_API_KEY;
-      } else if (process.env.ANTHROPIC_AUTH_TOKEN) {
-        fwd['authorization'] = `Bearer ${process.env.ANTHROPIC_AUTH_TOKEN}`;
+      } else {
+        const upstreamAuthToken = process.env.EVOMAP_ANTHROPIC_AUTH_TOKEN
+          || (process.env.EVOMAP_PROXY_AUTO_INJECTED === '1' ? '' : process.env.ANTHROPIC_AUTH_TOKEN);
+        if (upstreamAuthToken) {
+          fwd['authorization'] = `Bearer ${upstreamAuthToken}`;
+        }
       }
     }
 

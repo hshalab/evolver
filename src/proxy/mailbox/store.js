@@ -91,6 +91,7 @@ function safeParse(payload) {
 // equally valid on Windows. No platform-specific code is needed here.
 function appendLine(filePath, obj) {
   fs.appendFileSync(filePath, JSON.stringify(obj) + '\n', 'utf8');
+  try { fs.chmodSync(filePath, 0o600); } catch { /* best effort */ }
 }
 
 function readLines(filePath) {

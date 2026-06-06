@@ -31,6 +31,137 @@ function isEvolverPackageJson(filePath) {
   }
 }
 
+// Scan a "versions dir" used by Node version managers (NVM, fnm, Volta, asdf)
+// and append each `<versions-dir>/<version>/<subdir>/node_modules` to `out`.
+// Skips silently when the versions dir does not exist (typical case — most
+// users have at most one version manager). Most-recent-mtime first so the
+// active version is preferred when a user has multiple Node versions
+// installed.
+function _scanVersionedNodeModules(versionsDir, subdir, out) {
+  let entries;
+  try {
+    entries = fs.readdirSync(versionsDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const dirs = entries
+    .filter((e) => e.isDirectory && e.isDirectory())
+    .map((e) => {
+      const full = path.join(versionsDir, e.name);
+      let mtime = 0;
+      try { mtime = fs.statSync(full).mtimeMs; } catch {}
+      return { full, mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+  for (const d of dirs) {
+    out.push(path.join(d.full, subdir, 'node_modules'));
+  }
+}
+
+// Build the require.resolve paths array. All entries are user/system-scoped
+// install roots — process.cwd() is intentionally excluded for the same
+// prompt-injection reason as the original allowlist (see comment in
+// findEvolverRoot below).
+function _buildInstallSearchPaths() {
+  const home = os.homedir();
+  // Env-derived bases must be ABSOLUTE. A relative override (e.g. NVM_DIR='.nvm')
+  // or empty value would resolve against process.cwd() and let a hostile
+  // workspace plant a fake @evomap/evolver in the require.resolve allowlist —
+  // the prompt-injection surface PR #94 closed. isAbsolute is platform-matched
+  // (path.win32 recognises C:\ ...) so the guard holds on Windows too; a
+  // non-absolute override falls through to the trusted home/system default.
+  const _pathFlavor = process.platform === 'win32' ? path.win32 : path.posix;
+  const absEnv = (v) => (v && _pathFlavor.isAbsolute(v)) ? v : null;
+  const paths = [
+    // npm global with `npm config set prefix` overrides
+    path.join(home, '.npm-global', 'lib', 'node_modules'),
+    path.join(home, '.local', 'lib', 'node_modules'),
+    // System-wide (apt/yum nodejs, Intel Mac Homebrew)
+    '/usr/lib/node_modules',
+    '/usr/local/lib/node_modules',
+    // Apple Silicon Homebrew (default since macOS Big Sur on M1/M2/M3/M4 —
+    // the majority of Mac dev hardware sold since 2021). Without this
+    // entry, `npm install -g @evomap/evolver` on an Apple Silicon Mac
+    // lands at /opt/homebrew/lib/node_modules/@evomap/evolver and the
+    // hook scripts cannot find the package -> additionalContext is empty
+    // -> evolution memory never reaches the LLM.
+    '/opt/homebrew/lib/node_modules',
+    // Linuxbrew (Homebrew on Linux — niche but real).
+    '/home/linuxbrew/.linuxbrew/lib/node_modules',
+  ];
+  // Per-user Node version managers. Each manager has its own on-disk layout
+  // and its own base-dir env override; the version subdirectory is dynamic
+  // (e.g. `~/.nvm/versions/node/v22.15.0`) so we scan and append each
+  // version's node_modules. These were missing from the original hard-coded
+  // list even though NVM in particular is extremely common across all OSes.
+
+  // NVM. Globals are per-version under `<NVM_DIR>/versions/node/<ver>/lib`.
+  // NVM_DIR defaults to ~/.nvm but is frequently relocated.
+  const nvmDir = absEnv(process.env.NVM_DIR) || path.join(home, '.nvm');
+  _scanVersionedNodeModules(path.join(nvmDir, 'versions', 'node'), 'lib', paths);
+
+  // fnm. Each version lives under `<base>/node-versions/<ver>/installation/`,
+  // and fnm does NOT override the npm prefix, so globals are at
+  // `installation/lib/node_modules`. The base dir is XDG-first
+  // (`$XDG_DATA_HOME/fnm`, i.e. ~/.local/share/fnm on Linux and
+  // ~/Library/Application Support/fnm on macOS); `~/.fnm` is only the legacy
+  // fallback. `$FNM_DIR` overrides everything. Scan all candidate bases;
+  // _scanVersionedNodeModules silently skips the ones that don't exist.
+  const fnmSub = path.join('installation', 'lib');
+  const fnmBases = [];
+  if (absEnv(process.env.FNM_DIR)) fnmBases.push(process.env.FNM_DIR);
+  if (absEnv(process.env.XDG_DATA_HOME)) fnmBases.push(path.join(process.env.XDG_DATA_HOME, 'fnm'));
+  fnmBases.push(path.join(home, '.local', 'share', 'fnm'));            // Linux XDG default
+  fnmBases.push(path.join(home, 'Library', 'Application Support', 'fnm')); // macOS default
+  fnmBases.push(path.join(home, '.fnm'));                              // legacy
+  for (const base of fnmBases) {
+    _scanVersionedNodeModules(path.join(base, 'node-versions'), fnmSub, paths);
+  }
+
+  // Volta does NOT store global packages alongside the Node image. It
+  // sandboxes each `npm install -g`'d package under
+  // `<VOLTA_HOME>/tools/image/packages/<name>/lib/node_modules` (the scope
+  // becomes a real nested directory). Because we know the package name, this
+  // is a single fixed path rather than a version scan. VOLTA_HOME defaults to
+  // ~/.volta on macOS/Linux but to %LOCALAPPDATA%\Volta on Windows (where the
+  // globals actually live, and hook processes often don't inherit VOLTA_HOME).
+  // Verified against volta-cli/volta `volta-layout` v4 (`package_image_dir`) +
+  // `package/manager.rs` (`source_dir` = lib/node_modules).
+  const voltaHome = absEnv(process.env.VOLTA_HOME)
+    || (process.platform === 'win32'
+          ? path.join(absEnv(process.env.LOCALAPPDATA) || path.join(home, 'AppData', 'Local'), 'Volta')
+          : path.join(home, '.volta'));
+  paths.push(path.join(voltaHome, 'tools', 'image', 'packages', '@evomap', 'evolver', 'lib', 'node_modules'));
+
+  // asdf. Globals are per-version under `<data>/installs/nodejs/<ver>/`.
+  // asdf-nodejs dropped the `.npm` prefix override in PR #228 (Sept 2022),
+  // so modern installs use plain `lib/node_modules`; older installs (never
+  // re-created) still use `.npm/lib/node_modules`. Scan both. `$ASDF_DATA_DIR`
+  // overrides the ~/.asdf default (asdf 0.16+ Go rewrite).
+  const asdfData = absEnv(process.env.ASDF_DATA_DIR) || path.join(home, '.asdf');
+  const asdfVersions = path.join(asdfData, 'installs', 'nodejs');
+  _scanVersionedNodeModules(asdfVersions, 'lib', paths);                       // modern (post-#228)
+  _scanVersionedNodeModules(asdfVersions, path.join('.npm', 'lib'), paths);    // legacy (pre-#228)
+
+  // Windows: `npm install -g` puts packages under %APPDATA%\npm\node_modules
+  // (most common; same convention as `npm config get prefix` default on win32),
+  // %ProgramFiles%\nodejs\node_modules (system-wide installer), or
+  // %ProgramFiles(x86)%\nodejs\node_modules (32-bit Node on a 64-bit host).
+  // Conditional expansion keeps the POSIX base list untouched on Linux/macOS.
+  if (process.platform === 'win32') {
+    const appdata = absEnv(process.env.APPDATA) || path.join(home, 'AppData', 'Roaming');
+    paths.push(path.join(appdata, 'npm', 'node_modules'));
+    if (absEnv(process.env.ProgramFiles)) {
+      paths.push(path.join(process.env.ProgramFiles, 'nodejs', 'node_modules'));
+    }
+    if (absEnv(process.env['ProgramFiles(x86)'])) {
+      paths.push(path.join(process.env['ProgramFiles(x86)'], 'nodejs', 'node_modules'));
+    }
+  }
+
+  return paths;
+}
+
 function findEvolverRoot() {
   if (process.env.EVOLVER_ROOT) {
     const explicit = process.env.EVOLVER_ROOT;
@@ -57,39 +188,18 @@ function findEvolverRoot() {
   // be selected here and control `findMemoryGraph()` -> the memory graph
   // contents become attacker-controlled prompt-injection material in
   // `evolver-session-start.js`'s `additionalContext`. Restrict to trusted,
-  // user/system-scoped install roots.
+  // user/system-scoped install roots (built in `_buildInstallSearchPaths`).
   try {
-    // Windows: `npm install -g` puts packages under %APPDATA%\npm\node_modules
-    // (most common), %ProgramFiles%\nodejs\node_modules (system-wide installer),
-    // or %ProgramFiles(x86)%\nodejs\node_modules. Build the extra Windows paths
-    // conditionally so the POSIX base list stays intact.
-    const _winPaths = process.platform === 'win32'
-      ? [
-          path.join(
-            process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
-            'npm', 'node_modules'
-          ),
-          ...(process.env.ProgramFiles
-            ? [path.join(process.env.ProgramFiles, 'nodejs', 'node_modules')]
-            : []),
-          ...(process.env['ProgramFiles(x86)']
-            ? [path.join(process.env['ProgramFiles(x86)'], 'nodejs', 'node_modules')]
-            : []),
-        ]
-      : [];
-
+    // Allowlist of trusted user/system-scoped install roots. Built by
+    // _buildInstallSearchPaths() above so the list is one source of truth
+    // (Apple Silicon Homebrew, Linuxbrew, NVM / fnm / Volta / asdf,
+    // and Windows %APPDATA%\npm + %ProgramFiles%\nodejs install layouts).
+    // process.cwd() is intentionally excluded: a hostile workspace can plant
+    // its own node_modules/@evomap/evolver/package.json which would then
+    // control findMemoryGraph() and feed attacker-controlled content into
+    // evolver-session-start.js's additionalContext.
     const pkgJson = require.resolve('@evomap/evolver/package.json', {
-      // Do NOT include process.cwd() — a hostile workspace can plant its own
-      // node_modules/@evomap/evolver to gain control over the memory graph path
-      // (prompt-injection surface: evolver-session-start.js additionalContext).
-      // Only trust user/system-scoped install roots.
-      paths: [
-        path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
-        path.join(os.homedir(), '.local', 'lib', 'node_modules'),
-        '/usr/lib/node_modules',
-        '/usr/local/lib/node_modules',
-        ..._winPaths,
-      ],
+      paths: _buildInstallSearchPaths(),
     });
     if (pkgJson && isEvolverPackageJson(pkgJson)) {
       return path.dirname(pkgJson);
@@ -293,10 +403,10 @@ function findMemoryGraph(evolverRoot) {
 }
 
 // Is `dir` inside a git work tree? Cheap, no-shell `git rev-parse`. Returns
-// false on any error (git missing, not a repo, timeout) and never throws — the
-// session-start hook uses this only to decide whether to surface a one-line
-// "evolver needs a git workspace" notice, so a false negative just suppresses
-// the notice rather than breaking anything.
+// false on any error (git missing, not a repo, timeout) and never throws.
+// The session-start hook uses this only to decide whether to surface a
+// one-line "evolver needs a git workspace" notice, so a false negative just
+// suppresses the notice rather than breaking anything.
 function isGitWorkspace(dir) {
   try {
     const res = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
@@ -312,4 +422,18 @@ function isGitWorkspace(dir) {
   }
 }
 
-module.exports = { findEvolverRoot, findMemoryGraph, resolveProjectDir, resolveWorkspaceId, isGitWorkspace };
+module.exports = {
+  findEvolverRoot,
+  findMemoryGraph,
+  resolveProjectDir,
+  resolveWorkspaceId,
+  isGitWorkspace,
+  // Test-only: exposes the install-path builder so the test suite can
+  // verify Apple Silicon Homebrew + version-manager (NVM/fnm/Volta/asdf)
+  // + Windows %APPDATA%\npm paths are included without going through the
+  // full require.resolve chain (which depends on a real filesystem layout).
+  __internals: {
+    buildInstallSearchPaths: _buildInstallSearchPaths,
+    scanVersionedNodeModules: _scanVersionedNodeModules,
+  },
+};
