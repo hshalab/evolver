@@ -129,6 +129,39 @@ async function refreshOAuthToken(opts = {}) {
   return tok.access_token;
 }
 
+/**
+ * Background auto-refresh for long-running processes (`evolver run`): schedule a
+ * refresh ~2min before the current token expires, then reschedule after each
+ * refresh. No-op when there is no refresh token (e.g. node_secret-only nodes).
+ * The timer is unref'd so it never blocks process exit. Returns a stop() fn.
+ * `now`/`setTimer`/`clearTimer` are injectable for tests.
+ */
+function startTokenAutoRefresh(opts = {}) {
+  const now = opts.now || (() => Date.now());
+  const setTimer = opts.setTimer || ((fn, ms) => setTimeout(fn, ms));
+  const clearTimer = opts.clearTimer || ((h) => clearTimeout(h));
+  const MIN_DELAY_MS = 15 * 1000;
+  const SKEW_MS = 2 * 60 * 1000;
+  let handle = null;
+  let stopped = false;
+
+  function scheduleNext() {
+    if (stopped) return;
+    const t = loadOAuthToken();
+    // Only auto-refresh when we actually have a refresh token to use.
+    if (!t || !t.refresh_token || typeof t.expires_at !== 'number') return;
+    const delay = Math.max(MIN_DELAY_MS, t.expires_at - now() - SKEW_MS);
+    handle = setTimer(async () => {
+      try { await refreshOAuthToken(opts); } catch {}
+      scheduleNext();
+    }, delay);
+    if (handle && typeof handle.unref === 'function') handle.unref();
+  }
+
+  scheduleNext();
+  return function stop() { stopped = true; if (handle) clearTimer(handle); };
+}
+
 module.exports = {
   tokenFile,
   loadOAuthToken,
@@ -138,6 +171,7 @@ module.exports = {
   resolveHubUrl,
   deviceLogin,
   refreshOAuthToken,
+  startTokenAutoRefresh,
   CLIENT_ID,
   DEFAULT_SCOPES,
 };

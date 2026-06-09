@@ -96,3 +96,33 @@ test('buildHubHeaders prefers a valid OAuth token over node_secret', async () =>
   const headers = a2a.buildHubHeaders();
   assert.equal(headers.Authorization, 'Bearer OAUTH_AT');
 });
+
+test('startTokenAutoRefresh: schedules ~2min before expiry, refreshes, reschedules', async () => {
+  tmpHome();
+  const m = load();
+  const now = Date.now();
+  m.saveOAuthToken({ access_token: 'AT1', refresh_token: 'RT1', expires_at: now + 3600_000 });
+  let scheduledDelay = null;
+  let firedFn = null;
+  const fakeSetTimer = (fn, ms) => { scheduledDelay = ms; firedFn = fn; return { unref() {} }; };
+  const restore = stubFetch(() => ({ status: 200, json: { access_token: 'AT2', refresh_token: 'RT2', expires_in: 3600 } }));
+  try {
+    const stop = m.startTokenAutoRefresh({ setTimer: fakeSetTimer, clearTimer: () => {}, now: () => now });
+    // ~ (3600_000 - 2*60_000) = 3_480_000 ms before expiry
+    assert.equal(scheduledDelay, 3_480_000);
+    await firedFn(); // simulate the timer firing -> refresh + reschedule
+    assert.equal(m.loadOAuthToken().access_token, 'AT2');
+    stop();
+  } finally {
+    restore();
+  }
+});
+
+test('startTokenAutoRefresh: no-op when there is no refresh token', () => {
+  tmpHome();
+  const m = load();
+  m.saveOAuthToken({ access_token: 'AT', expires_at: Date.now() + 3600_000 }); // no refresh_token
+  let scheduled = false;
+  m.startTokenAutoRefresh({ setTimer: () => { scheduled = true; return {}; } });
+  assert.equal(scheduled, false);
+});

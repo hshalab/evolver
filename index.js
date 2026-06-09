@@ -1232,6 +1232,19 @@ async function main() {
           console.warn('[ValidatorDaemon] failed to start: ' + (vdErr && vdErr.message || vdErr));
         }
 
+        // OAuth token auto-refresh: if a device-flow OAuth token is present,
+        // keep it fresh in the background so long-running `evolver run` loops
+        // never hit an expired a2a token mid-request. No-op for node_secret nodes.
+        try {
+          const { loadOAuthToken, startTokenAutoRefresh } = require('./src/gep/oauthLogin');
+          if (loadOAuthToken()) {
+            startTokenAutoRefresh();
+            console.log('[OAuth] token auto-refresh scheduled.');
+          }
+        } catch (oauthRefreshErr) {
+          console.warn('[OAuth] auto-refresh setup failed: ' + (oauthRefreshErr && oauthRefreshErr.message || oauthRefreshErr));
+        }
+
         // ATP: auto-start merchant agent if enabled
         try {
           const { defaultHandler, merchantAgent } = require('./src/atp');
