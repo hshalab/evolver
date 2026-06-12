@@ -94,7 +94,12 @@ This project uses evolver for self-evolution. Hooks automatically:
 2. Detect evolution signals during file edits
 3. Record outcomes at session end
 
-For substantive tasks, call \`gep_recall\` before work and \`gep_record_outcome\` after.
+When the Codex Desktop Evolver plugin is installed, use its MCP tools directly:
+- Before substantive work, call \`evolver_status\`, then \`evolver_search_assets\` with concise task signals.
+- If assets match, call \`evolver_fetch_asset\` for the promising IDs and apply the reusable guidance.
+- After the task, call \`evolver_publish_asset\` only for reusable Genes/Capsules; otherwise rely on the installed Stop hook to record the local outcome.
+
+If your environment exposes legacy \`gep_recall\` / \`gep_record_outcome\` aliases, those aliases are equivalent workflow steps, but Codex Desktop plugin installs expose the \`evolver_*\` tool names by default.
 Signals: log_error, perf_bottleneck, user_feature_request, capability_gap, deployment_issue, test_failure.`;
 }
 

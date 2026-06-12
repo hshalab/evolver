@@ -804,6 +804,11 @@ describe('codex adapter', () => {
       const toml = fs.readFileSync(path.join(tmp, '.codex', 'config.toml'), 'utf8');
       assert.ok(toml.includes('codex_hooks = true'));
       assert.ok(fs.existsSync(path.join(tmp, 'AGENTS.md')));
+      const agentsMd = fs.readFileSync(path.join(tmp, 'AGENTS.md'), 'utf8');
+      assert.ok(agentsMd.includes('evolver_status'));
+      assert.ok(agentsMd.includes('evolver_search_assets'));
+      assert.ok(agentsMd.includes('evolver_publish_asset'));
+      assert.ok(!agentsMd.includes('For substantive tasks, call `gep_recall` before work'));
     } finally { cleanup(tmp); }
   });
 
