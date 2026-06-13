@@ -10,6 +10,8 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
     sessionHandler,
     messagesHandler,
     responsesHandler,
+    geminiHandler,
+    chatCompletionsHandler,
   } = extensions || {};
   const routes = {
     // -- Mailbox --
@@ -475,6 +477,15 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
   }
   if (responsesHandler) {
     routes['POST /v1/responses'] = responsesHandler;
+  }
+  if (geminiHandler) {
+    // Native Gemini path: model + action (generateContent | streamGenerateContent) are one path segment
+    // (`<model>:<action>`), matched as :modelAction and split by the handler.
+    routes['POST /v1beta/models/:modelAction'] = geminiHandler;
+  }
+  if (chatCompletionsHandler) {
+    // OpenAI Chat Completions ingress (cursor's OpenAI mode + generic OpenAI clients) → OpenAI upstream.
+    routes['POST /v1/chat/completions'] = chatCompletionsHandler;
   }
 
   return routes;

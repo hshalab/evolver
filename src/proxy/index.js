@@ -6,7 +6,8 @@ const { ProxyHttpServer } = require('./server/http');
 const { buildRoutes } = require('./server/routes');
 const { buildMessagesHandler, canonicalizeForBedrock, supportsAdaptiveThinking } = require('./router/messages_route');
 const { ensureEnvelope } = require('./envelope');
-const { buildResponsesHandler } = require('./router/responses_route');
+const { buildResponsesHandler, buildChatCompletionsHandler } = require('./router/responses_route');
+const { buildGeminiHandler } = require('./router/gemini_route');
 const { SyncEngine } = require('./sync/engine');
 const { LifecycleManager } = require('./lifecycle/manager');
 const { TaskMonitor } = require('./task/monitor');
@@ -24,6 +25,7 @@ const TRACE_BACKFILL_RUNTIME_DRAIN_MAX_MS = 50;
 function _defaultDataDir() { return getEvomapPath('mailbox'); }
 
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
 
 function isAllowedOpenAIHostname(hostname) {
   const h = String(hostname || '').toLowerCase();
@@ -58,6 +60,15 @@ function makeOpenAIGatewayError(err, fallbackStatus = 502) {
   const name = err && err.name ? String(err.name) : '';
   const isTimeout = name === 'TimeoutError' || name === 'AbortError';
   const out = new Error(isTimeout ? 'openai upstream timed out' : 'openai upstream request failed');
+  out.statusCode = isTimeout ? 504 : fallbackStatus;
+  out.cause = err;
+  return out;
+}
+
+function makeGeminiGatewayError(err, fallbackStatus = 502) {
+  const name = err && err.name ? String(err.name) : '';
+  const isTimeout = name === 'TimeoutError' || name === 'AbortError';
+  const out = new Error(isTimeout ? 'gemini upstream timed out' : 'gemini upstream request failed');
   out.statusCode = isTimeout ? 504 : fallbackStatus;
   out.cause = err;
   return out;
@@ -126,6 +137,7 @@ class EvoMapProxy {
     this._skillPath = opts.skillPath || null;
     this._anthropicBaseUrl = (opts.anthropicBaseUrl || process.env.EVOMAP_ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
     this._openaiBaseUrl = String(opts.openaiBaseUrl || process.env.EVOMAP_OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, '');
+    this._geminiBaseUrl = String(opts.geminiBaseUrl || process.env.EVOMAP_GEMINI_BASE_URL || DEFAULT_GEMINI_BASE_URL).replace(/\/+$/, '');
     this._openaiBaseUrlTrusted = !!opts.openaiBaseUrl;
 
     this.store = null;
@@ -252,6 +264,18 @@ class EvoMapProxy {
       traceStore: this.store,
       onTraceQueued: () => this.sync?.notifyNewOutbound(),
     });
+    const geminiHandler = buildGeminiHandler({
+      geminiProxy: (reqPath, body, opts) => this._proxyGemini(reqPath, body, opts),
+      logger: this.logger,
+      traceStore: this.store,
+      onTraceQueued: () => this.sync?.notifyNewOutbound(),
+    });
+    const chatCompletionsHandler = buildChatCompletionsHandler({
+      openAIProxy: (reqPath, body, opts) => this._proxyOpenAIResponses(reqPath, body, opts),
+      logger: this.logger,
+      traceStore: this.store,
+      onTraceQueued: () => this.sync?.notifyNewOutbound(),
+    });
 
     const routes = buildRoutes(this.store, proxyHandlers, this.taskMonitor, {
       dmHandler: this.dmHandler,
@@ -260,6 +284,8 @@ class EvoMapProxy {
       getHubMailboxStatus: () => this._getHubMailboxStatus(),
       messagesHandler,
       responsesHandler,
+      geminiHandler,
+      chatCompletionsHandler,
     });
 
     const OUTBOUND_ROUTES = [
@@ -603,6 +629,80 @@ class EvoMapProxy {
         return await res.text();
       } catch (err) {
         throw makeOpenAIGatewayError(err);
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    };
+
+    return {
+      status: res.status,
+      headers,
+      stream: isStream ? res.body : null,
+      json: isStream ? null : async () => JSON.parse(await readText()),
+      text: isStream ? null : readText,
+    };
+  }
+
+  // Gemini upstream (Google Generative Language API). Native passthrough — the model + action live in the path
+  // (`/v1beta/models/<model>:generateContent` | `:streamGenerateContent`), not the body, so we forward reqPath
+  // (incl. query like ?alt=sse) verbatim. Auth is the `x-goog-api-key` header (proxy-mediated). No translation:
+  // a Gemini-shaped request goes to a Gemini upstream, same return contract as the other providers.
+  async _proxyGemini(reqPath, body, opts = {}) {
+    const baseUrl = (opts.baseUrl || this._geminiBaseUrl || DEFAULT_GEMINI_BASE_URL).replace(/\/+$/, '');
+    const inbound = opts.inboundHeaders || {};
+    const timeoutMs = opts.timeoutMs || 60_000;
+
+    const fwd = { 'content-type': 'application/json' };
+    for (const [k, v] of Object.entries(inbound)) {
+      if (v === undefined || v === null) continue;
+      const lk = k.toLowerCase();
+      // Forward Gemini metadata headers; the api key is injected below (never trust the inbound one).
+      if (lk === 'x-goog-user-project' || lk === 'x-goog-api-client' || lk.startsWith('x-goog-request-')) {
+        fwd[lk] = Array.isArray(v) ? v.join(', ') : String(v);
+      }
+    }
+
+    const upstreamKey = process.env.EVOMAP_GEMINI_API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+    if (!upstreamKey) {
+      const err = new Error('gemini api key required');
+      err.statusCode = 401;
+      throw err;
+    }
+    fwd['x-goog-api-key'] = upstreamKey;
+
+    const endpoint = `${baseUrl}${reqPath}`;
+    const abortController = new AbortController();
+    const timeoutErr = new Error('gemini upstream timed out');
+    timeoutErr.name = 'TimeoutError';
+    const abortTimer = setTimeout(() => abortController.abort(timeoutErr), timeoutMs);
+    abortTimer.unref?.();
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: fwd,
+        body: JSON.stringify(body || {}),
+        signal: abortController.signal,
+      });
+    } catch (err) {
+      clearTimeout(abortTimer);
+      throw makeGeminiGatewayError(err);
+    }
+
+    const headers = Object.fromEntries(res.headers.entries());
+    const contentType = (headers['content-type'] || '').toLowerCase();
+    // `:streamGenerateContent` IS a stream regardless of content-type: with ?alt=sse it is text/event-stream,
+    // but the DEFAULT (no alt=sse) is a chunked JSON-array stream served as application/json. Detecting only by
+    // content-type would buffer + JSON.parse that array stream and hand the client a broken {error:...} wrapper
+    // instead of a live stream. Forward the body as a stream whenever the action is streamGenerateContent.
+    const isStream = contentType.includes('text/event-stream') || /:streamGenerateContent(\b|\?|$)/.test(reqPath);
+    if (isStream) clearTimeout(abortTimer);
+
+    const readText = async () => {
+      try {
+        return await res.text();
+      } catch (err) {
+        throw makeGeminiGatewayError(err);
       } finally {
         clearTimeout(abortTimer);
       }

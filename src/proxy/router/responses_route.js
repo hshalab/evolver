@@ -66,7 +66,11 @@ function copyOpenAIResponseHeaders(headers = {}) {
   return out;
 }
 
-function buildResponsesHandler({ openAIProxy, logger, traceStore, onTraceQueued } = {}) {
+// Generic OpenAI passthrough handler. `upstreamPath` selects the OpenAI endpoint (/responses for codex's
+// Responses API, /chat/completions for the Chat Completions API used by cursor's OpenAI mode + generic OpenAI
+// clients). Both share the same upstream, auth, header allow-list, trace, and stream tee — the only difference
+// is the path + the trace route label. No translation: each OpenAI dialect goes to its native OpenAI endpoint.
+function buildResponsesHandler({ openAIProxy, logger, traceStore, onTraceQueued, upstreamPath = '/responses', traceRoute = 'POST /v1/responses' } = {}) {
   if (typeof openAIProxy !== 'function') {
     throw new Error('buildResponsesHandler requires openAIProxy(path, body, opts)');
   }
@@ -82,7 +86,7 @@ function buildResponsesHandler({ openAIProxy, logger, traceStore, onTraceQueued 
     let trace = null;
     try {
       trace = createProxyTrace({
-        route: 'POST /v1/responses',
+        route: traceRoute,
         headers: inboundHeaders,
         body,
         upstreamMode: 'openai',
@@ -96,7 +100,7 @@ function buildResponsesHandler({ openAIProxy, logger, traceStore, onTraceQueued 
 
     let upstream;
     try {
-      upstream = await openAIProxy('/responses', body, {
+      upstream = await openAIProxy(upstreamPath, body, {
         inboundHeaders,
         upstreamMode: 'openai',
       });
@@ -151,8 +155,15 @@ function buildResponsesHandler({ openAIProxy, logger, traceStore, onTraceQueued 
   };
 }
 
+// OpenAI Chat Completions ingress (cursor's OpenAI mode + generic OpenAI clients). Same OpenAI upstream as the
+// Responses handler, just the /chat/completions endpoint — point an OpenAI-Chat client's base URL at the proxy.
+function buildChatCompletionsHandler(opts = {}) {
+  return buildResponsesHandler({ ...opts, upstreamPath: '/chat/completions', traceRoute: 'POST /v1/chat/completions' });
+}
+
 module.exports = {
   buildResponsesHandler,
+  buildChatCompletionsHandler,
   copyOpenAIResponseHeaders,
   hasOpenAIUpstreamCredential,
   responseToBody,
