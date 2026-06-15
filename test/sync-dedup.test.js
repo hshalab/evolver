@@ -61,7 +61,7 @@ function runSync(env, extraArgs) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, argv, {
       cwd,
-      env: { ...process.env, ...env },
+      env: { ...process.env, EVOMAP_HUB_ALLOW_INSECURE: '1', ...env },
     });
     let stdout = '';
     let stderr = '';

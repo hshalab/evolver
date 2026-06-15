@@ -16,11 +16,13 @@
 const fs = require('fs');
 const path = require('path');
 const { getEvomapDir } = require('./paths');
+const { resolveHubUrl: resolveDefaultHubUrl } = require('../config');
+const { enforceHubScheme, hubFetch } = require('./hubFetch');
 
 const CLIENT_ID = 'evolver-cli';
 const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 const DEFAULT_SCOPES = 'a2a recipe:read recipe:write recipe:publish gene:read reuse:query';
-const DEFAULT_HUB_URL = 'https://evomap.ai';
+const OAUTH_TIMEOUT_MS = 30000;
 // Refresh slightly early so a token in active use does not expire mid-request.
 const EXPIRY_SKEW_MS = 60 * 1000;
 
@@ -55,15 +57,19 @@ function clearOAuthToken() {
 }
 
 function resolveHubUrl(explicit) {
-  const u = (explicit || process.env.A2A_HUB_URL || process.env.EVOMAP_HUB_URL || DEFAULT_HUB_URL).replace(/\/+$/, '');
+  const u = explicit
+    ? String(explicit).replace(/\/+$/, '')
+    : resolveDefaultHubUrl().replace(/\/+$/, '');
+  enforceHubScheme(u);
   return u;
 }
 
 async function postJson(url, body) {
-  const res = await fetch(url, {
+  const res = await hubFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(OAUTH_TIMEOUT_MS),
   });
   let json = {};
   try { json = await res.json(); } catch {}

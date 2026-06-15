@@ -1,6 +1,32 @@
 // ATP Service Helper -- wraps marketplace service publishing for merchant agents.
 
 const { getNodeId, buildHubHeaders, getHubUrl } = require('../gep/a2aProtocol');
+const { hubFetch } = require('../gep/hubFetch');
+const { HTTP_TRANSPORT_TIMEOUT_MS } = require('../config');
+
+async function postService(endpoint, body) {
+  try {
+    const res = await hubFetch(endpoint, {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, buildHubHeaders() || {}),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(HTTP_TRANSPORT_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return { ok: false, status: res.status, error: t.slice(0, 400) };
+    }
+    const data = await res.json();
+    return { ok: true, data };
+  } catch (err) {
+    const msg = (err && err.message) || String(err);
+    if (msg.indexOf('[hubFetch]') !== -1) {
+      return { ok: false, error: 'tls_refused: ' + msg };
+    }
+    return { ok: false, error: msg };
+  }
+}
 
 /**
  * Publish a ServiceListing via the Hub marketplace API.
@@ -21,7 +47,6 @@ async function publishService(svc) {
 
   const nodeId = getNodeId();
   const endpoint = hubUrl.replace(/\/+$/, '') + '/a2a/service/publish';
-  const timeout = require('../config').HTTP_TRANSPORT_TIMEOUT_MS;
 
   const body = {
     sender_id: nodeId,
@@ -35,23 +60,7 @@ async function publishService(svc) {
     recipe_id: svc.recipeId,
   };
 
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: buildHubHeaders(),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeout),
-    });
-
-    if (!res.ok) {
-      const t = await res.text();
-      return { ok: false, status: res.status, error: t.slice(0, 400) };
-    }
-    const data = await res.json();
-    return { ok: true, data };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
+  return postService(endpoint, body);
 }
 
 /**
@@ -66,7 +75,6 @@ async function updateService(listingId, updates) {
 
   const nodeId = getNodeId();
   const endpoint = hubUrl.replace(/\/+$/, '') + '/a2a/service/update';
-  const timeout = require('../config').HTTP_TRANSPORT_TIMEOUT_MS;
 
   const body = {
     sender_id: nodeId,
@@ -74,23 +82,7 @@ async function updateService(listingId, updates) {
     ...updates,
   };
 
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: buildHubHeaders(),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeout),
-    });
-
-    if (!res.ok) {
-      const t = await res.text();
-      return { ok: false, status: res.status, error: t.slice(0, 400) };
-    }
-    const data = await res.json();
-    return { ok: true, data };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
+  return postService(endpoint, body);
 }
 
 module.exports = {

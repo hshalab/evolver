@@ -86,14 +86,17 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
     },
 
     'POST /asset/submit': async ({ body }) => {
-      if (!body.assets && !body.asset_id) {
-        throw Object.assign(new Error('assets or asset_id is required'), { statusCode: 400 });
+      // The publish path builds a bundle from full asset objects; a bare
+      // asset_id is not a valid input here (Bugbot #256 Medium — route used to
+      // accept asset_id the handler then ignored).
+      if (!body.assets && !body.asset) {
+        throw Object.assign(new Error('assets (array) or asset (single object) is required'), { statusCode: 400 });
       }
-      const result = store.send({
-        type: 'asset_submit',
-        payload: body,
-        priority: body.priority || 'normal',
-      });
+      // Publish synchronously via the signed Gene+Capsule bundle path
+      // (POST /a2a/publish). The old `asset_submit` mailbox dispatch is gated
+      // off at the Hub (A2A_MAILBOX_ASSET_SUBMIT_ENABLED), so it silently
+      // failed; the Hub now enforces bundles. Returns the per-asset Hub result.
+      const result = await proxyHandlers.assetPublish(body);
       return { body: result };
     },
 

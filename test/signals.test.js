@@ -492,4 +492,196 @@ describe('signals.js source hardening (GHSA-j5w5-568x-rq53)', () => {
     // execFileSync is the mandated replacement.
     assert.ok(/execFileSync/.test(src), 'signals.js must use execFileSync instead of execSync for HTTP');
   });
+
+  it('defaults curl Hub probing to IPv4 unless dual-stack is explicit', () => {
+    const { _curlHubIpFamilyArgs, _curlHubIpFamilyAttempts } = require('../src/gep/signals');
+    assert.deepEqual(_curlHubIpFamilyArgs({}), ['-4']);
+    assert.deepEqual(_curlHubIpFamilyArgs({ EVOMAP_HUB_IP_FAMILY: 'ipv4' }), ['-4']);
+    assert.deepEqual(_curlHubIpFamilyArgs({ EVOMAP_HUB_IP_FAMILY: 'ipv4first' }), ['-4']);
+    assert.deepEqual(_curlHubIpFamilyArgs({ EVOMAP_HUB_IP_FAMILY: 'ipv4-only' }), ['-4']);
+    assert.deepEqual(_curlHubIpFamilyArgs({ EVOMAP_HUB_IP_FAMILY: 'ipv4only' }), ['-4']);
+    assert.deepEqual(_curlHubIpFamilyArgs({ EVOMAP_HUB_IP_FAMILY: 'auto' }), []);
+    assert.deepEqual(_curlHubIpFamilyAttempts({}), [['-4'], []]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'ipv4' }), [['-4'], []]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'ipv4first' }), [['-4'], []]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'ipv4-only' }), [['-4']]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'ipv4only' }), [['-4']]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'auto' }), [[]]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'dualstack' }), [[]]);
+    assert.deepEqual(_curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'dual-stack' }), [[]]);
+    assert.throws(() => _curlHubIpFamilyAttempts({ EVOMAP_HUB_IP_FAMILY: 'bad-family' }), /EVOMAP_HUB_IP_FAMILY/);
+  });
+
+  it('refuses insecure Hub URL before invoking curl', () => {
+    const signalsPath = require.resolve('../src/gep/signals');
+    const a2aPath = require.resolve('../src/gep/a2aProtocol');
+    const oldSignals = require.cache[signalsPath];
+    const oldA2a = require.cache[a2aPath];
+    const cp = require('child_process');
+    const oldExecFileSync = cp.execFileSync;
+    const oldAllowInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    let calls = 0;
+
+    try {
+      delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+      delete require.cache[signalsPath];
+      require.cache[a2aPath] = {
+        id: a2aPath,
+        filename: a2aPath,
+        loaded: true,
+        exports: {
+          getHubUrl: () => 'http://hub.example',
+          getHubNodeSecret: () => 'secret_test',
+          getNodeId: () => 'node_test',
+        },
+      };
+      cp.execFileSync = () => { calls += 1; return '{"signals":["capability_gap"]}'; };
+
+      const { _extractLLM } = require('../src/gep/signals');
+      assert.deepEqual(_extractLLM('needs semantic help'), []);
+      assert.equal(calls, 0, 'curl must not run after Hub scheme refusal');
+    } finally {
+      cp.execFileSync = oldExecFileSync;
+      if (oldSignals) require.cache[signalsPath] = oldSignals;
+      else delete require.cache[signalsPath];
+      if (oldA2a) require.cache[a2aPath] = oldA2a;
+      else delete require.cache[a2aPath];
+      if (oldAllowInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+      else process.env.EVOMAP_HUB_ALLOW_INSECURE = oldAllowInsecure;
+    }
+  });
+
+  it('passes bearer to curl via stdin config rather than argv', () => {
+    const signalsPath = require.resolve('../src/gep/signals');
+    const a2aPath = require.resolve('../src/gep/a2aProtocol');
+    const oldSignals = require.cache[signalsPath];
+    const oldA2a = require.cache[a2aPath];
+    const cp = require('child_process');
+    const oldExecFileSync = cp.execFileSync;
+    const secret = 'secret_should_not_be_in_argv';
+    let captured = null;
+
+    try {
+      delete require.cache[signalsPath];
+      require.cache[a2aPath] = {
+        id: a2aPath,
+        filename: a2aPath,
+        loaded: true,
+        exports: {
+          getHubUrl: () => 'https://hub.example',
+          getHubNodeSecret: () => secret,
+          getNodeId: () => 'node_test',
+        },
+      };
+      cp.execFileSync = (cmd, args, opts) => {
+        captured = { cmd, args, opts };
+        return '{"signals":["capability_gap"]}';
+      };
+
+      const { _extractLLM } = require('../src/gep/signals');
+      assert.deepEqual(_extractLLM('"; rm -rf /'), ['capability_gap']);
+      assert.equal(captured.cmd, 'curl');
+      assert.ok(Array.isArray(captured.args), 'curl must be invoked without a shell string');
+      assert.equal(captured.args.join(' ').includes(secret), false, 'bearer token must not appear in argv');
+      assert.equal(captured.args.join(' ').includes('Authorization: Bearer'), false, 'authorization header must not appear in argv');
+      assert.ok(String(captured.opts.input).includes('Authorization: Bearer ' + secret),
+        'bearer token should be supplied through curl config stdin');
+      assert.deepEqual(captured.opts.stdio, ['pipe', 'pipe', 'pipe']);
+      assert.equal(captured.opts.windowsHide, true);
+    } finally {
+      cp.execFileSync = oldExecFileSync;
+      if (oldSignals) require.cache[signalsPath] = oldSignals;
+      else delete require.cache[signalsPath];
+      if (oldA2a) require.cache[a2aPath] = oldA2a;
+      else delete require.cache[a2aPath];
+    }
+  });
+
+  it('falls back to dual-stack curl when default IPv4 probe fails', () => {
+    const signalsPath = require.resolve('../src/gep/signals');
+    const a2aPath = require.resolve('../src/gep/a2aProtocol');
+    const oldSignals = require.cache[signalsPath];
+    const oldA2a = require.cache[a2aPath];
+    const cp = require('child_process');
+    const oldExecFileSync = cp.execFileSync;
+    const oldFamily = process.env.EVOMAP_HUB_IP_FAMILY;
+    const attempts = [];
+
+    try {
+      delete process.env.EVOMAP_HUB_IP_FAMILY;
+      delete require.cache[signalsPath];
+      require.cache[a2aPath] = {
+        id: a2aPath,
+        filename: a2aPath,
+        loaded: true,
+        exports: {
+          getHubUrl: () => 'https://hub.example',
+          getHubNodeSecret: () => 'secret_test',
+          getNodeId: () => 'node_test',
+        },
+      };
+      cp.execFileSync = (_cmd, args) => {
+        attempts.push(args);
+        if (attempts.length === 1) throw Object.assign(new Error('ipv4 failed'), { code: 'ENETUNREACH' });
+        return '{"signals":["external_opportunity"]}';
+      };
+
+      const { _extractLLM } = require('../src/gep/signals');
+      assert.deepEqual(_extractLLM('need network fallback'), ['external_opportunity']);
+      assert.equal(attempts.length, 2);
+      assert.ok(attempts[0].includes('-4'), 'first curl attempt should force IPv4');
+      assert.equal(attempts[1].includes('-4'), false, 'second curl attempt should restore dual-stack');
+    } finally {
+      cp.execFileSync = oldExecFileSync;
+      if (oldSignals) require.cache[signalsPath] = oldSignals;
+      else delete require.cache[signalsPath];
+      if (oldA2a) require.cache[a2aPath] = oldA2a;
+      else delete require.cache[a2aPath];
+      if (oldFamily === undefined) delete process.env.EVOMAP_HUB_IP_FAMILY;
+      else process.env.EVOMAP_HUB_IP_FAMILY = oldFamily;
+    }
+  });
+
+  it('does not run dual-stack fallback when ipv4-only curl probe fails', () => {
+    const signalsPath = require.resolve('../src/gep/signals');
+    const a2aPath = require.resolve('../src/gep/a2aProtocol');
+    const oldSignals = require.cache[signalsPath];
+    const oldA2a = require.cache[a2aPath];
+    const cp = require('child_process');
+    const oldExecFileSync = cp.execFileSync;
+    const oldFamily = process.env.EVOMAP_HUB_IP_FAMILY;
+    const attempts = [];
+
+    try {
+      process.env.EVOMAP_HUB_IP_FAMILY = 'ipv4-only';
+      delete require.cache[signalsPath];
+      require.cache[a2aPath] = {
+        id: a2aPath,
+        filename: a2aPath,
+        loaded: true,
+        exports: {
+          getHubUrl: () => 'https://hub.example',
+          getHubNodeSecret: () => 'secret_test',
+          getNodeId: () => 'node_test',
+        },
+      };
+      cp.execFileSync = (_cmd, args) => {
+        attempts.push(args);
+        throw Object.assign(new Error('ipv4 failed'), { code: 'ENETUNREACH' });
+      };
+
+      const { _extractLLM } = require('../src/gep/signals');
+      assert.deepEqual(_extractLLM('need ipv4-only fail closed'), []);
+      assert.equal(attempts.length, 1);
+      assert.ok(attempts[0].includes('-4'), 'ipv4-only curl attempt should force IPv4');
+    } finally {
+      cp.execFileSync = oldExecFileSync;
+      if (oldSignals) require.cache[signalsPath] = oldSignals;
+      else delete require.cache[signalsPath];
+      if (oldA2a) require.cache[a2aPath] = oldA2a;
+      else delete require.cache[a2aPath];
+      if (oldFamily === undefined) delete process.env.EVOMAP_HUB_IP_FAMILY;
+      else process.env.EVOMAP_HUB_IP_FAMILY = oldFamily;
+    }
+  });
 });

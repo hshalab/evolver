@@ -2042,6 +2042,7 @@ async function main() {
     }
 
     const { getHubUrl, getNodeId, buildHubHeaders, sendHelloToHub, getHubNodeSecret } = require('./src/gep/a2aProtocol');
+    const { hubFetch } = require('./src/gep/hubFetch');
 
     const hubUrl = getHubUrl();
     if (!hubUrl) {
@@ -2071,7 +2072,7 @@ async function main() {
 
       console.log('[fetch] Downloading skill: ' + skillId);
 
-      const resp = await fetch(endpoint, {
+      const resp = await hubFetch(endpoint, {
         method: 'POST',
         headers: buildHubHeaders(),
         body: JSON.stringify({ sender_id: nodeId }),
@@ -2253,6 +2254,7 @@ async function main() {
 
   } else if (command === 'sync') {
     const { getHubUrl, getNodeId, buildHubHeaders, sendHelloToHub, getHubNodeSecret } = require('./src/gep/a2aProtocol');
+    const { hubFetch } = require('./src/gep/hubFetch');
     const { upsertGene, upsertCapsule, loadGenes, loadCapsules } = require('./src/gep/assetStore');
     const { getGepAssetsDir, getMemoryDir } = require('./src/gep/paths');
 
@@ -2321,7 +2323,7 @@ async function main() {
               if (v != null) url += '&' + k + '=' + encodeURIComponent(v);
             }
           }
-          const resp = await fetch(url, {
+          const resp = await hubFetch(url, {
             method: 'GET',
             headers: buildHubHeaders(),
             signal: AbortSignal.timeout(30000),
@@ -2438,7 +2440,7 @@ async function main() {
         try {
           let payload = asset.payload;
           if (!payload) {
-            const detailResp = await fetch(baseUrl + '/a2a/assets/' + encodeURIComponent(assetId) + '?detailed=true', {
+            const detailResp = await hubFetch(baseUrl + '/a2a/assets/' + encodeURIComponent(assetId) + '?detailed=true', {
               method: 'GET',
               headers: buildHubHeaders(),
               signal: AbortSignal.timeout(15000),

@@ -30,8 +30,12 @@ describe('hubFetch — unit', () => {
   let hubFetchMod;
 
   beforeEach(() => {
-    savedEnv = { EVOMAP_HUB_ALLOW_INSECURE: process.env.EVOMAP_HUB_ALLOW_INSECURE };
+    savedEnv = {
+      EVOMAP_HUB_ALLOW_INSECURE: process.env.EVOMAP_HUB_ALLOW_INSECURE,
+      EVOMAP_HUB_IP_FAMILY: process.env.EVOMAP_HUB_IP_FAMILY,
+    };
     delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    delete process.env.EVOMAP_HUB_IP_FAMILY;
 
     capturedUrl = null;
     capturedOptions = null;
@@ -50,6 +54,11 @@ describe('hubFetch — unit', () => {
     } else {
       process.env.EVOMAP_HUB_ALLOW_INSECURE = savedEnv.EVOMAP_HUB_ALLOW_INSECURE;
     }
+    if (savedEnv.EVOMAP_HUB_IP_FAMILY === undefined) {
+      delete process.env.EVOMAP_HUB_IP_FAMILY;
+    } else {
+      process.env.EVOMAP_HUB_IP_FAMILY = savedEnv.EVOMAP_HUB_IP_FAMILY;
+    }
   });
 
   // --- happy path ---
@@ -65,6 +74,58 @@ describe('hubFetch — unit', () => {
     await hubFetch('https://hub.example.com/a2a/heartbeat', { method: 'POST' });
     assert.ok(capturedOptions.dispatcher instanceof Agent,
       'dispatcher must be an undici Agent (overrides NODE_TLS_REJECT_UNAUTHORIZED=0)');
+  });
+
+  it('defaults Hub connections to IPv4-first fallback to avoid IPv6 VPN leaks', () => {
+    const cfg = hubFetchMod._getHubFetchConfigForTest();
+    assert.equal(cfg.hubIpFamily, 'ipv4first');
+    assert.equal(cfg.connectOpts.family, 4);
+    assert.equal(cfg.connectOpts.autoSelectFamily, false);
+    assert.equal(cfg.primaryConnectOpts.family, 4);
+    assert.equal(cfg.primaryConnectOpts.timeout, cfg.ipv4FirstPrimaryConnectTimeoutMs);
+    assert.ok(
+      cfg.primaryConnectOpts.timeout < cfg.connectTimeoutMs,
+      'ipv4first primary probe must leave connect budget for fallback before heartbeat aborts',
+    );
+    assert.equal(cfg.fallbackConnectOpts.timeout, cfg.connectTimeoutMs);
+    assert.equal(cfg.fallbackConnectOpts.autoSelectFamily, true);
+    assert.equal(cfg.fallbackConnectOpts.autoSelectFamilyAttemptTimeout, 250);
+  });
+
+  it('EVOMAP_HUB_IP_FAMILY=ipv4-only disables dual-stack fallback', () => {
+    hubFetchMod._setFetchImplForTest(null);
+    process.env.EVOMAP_HUB_IP_FAMILY = 'ipv4-only';
+    hubFetchMod = freshHubFetch();
+
+    const cfg = hubFetchMod._getHubFetchConfigForTest();
+    assert.equal(cfg.hubIpFamily, 'ipv4only');
+    assert.equal(cfg.connectOpts.family, 4);
+    assert.equal(cfg.connectOpts.autoSelectFamily, false);
+    assert.equal(cfg.primaryConnectOpts.timeout, cfg.connectTimeoutMs);
+    assert.equal(cfg.fallbackConnectOpts, null);
+  });
+
+  it('EVOMAP_HUB_IP_FAMILY=auto restores dual-stack Happy Eyeballs', () => {
+    hubFetchMod._setFetchImplForTest(null);
+    process.env.EVOMAP_HUB_IP_FAMILY = 'auto';
+    hubFetchMod = freshHubFetch();
+
+    const cfg = hubFetchMod._getHubFetchConfigForTest();
+    assert.equal(cfg.hubIpFamily, 'auto');
+    assert.equal(cfg.connectOpts.timeout, cfg.connectTimeoutMs);
+    assert.equal(cfg.connectOpts.autoSelectFamily, true);
+    assert.equal(cfg.connectOpts.autoSelectFamilyAttemptTimeout, 250);
+    assert.equal('family' in cfg.connectOpts, false);
+    assert.equal(cfg.fallbackConnectOpts, null);
+  });
+
+  it('rejects unknown EVOMAP_HUB_IP_FAMILY values at module load', () => {
+    hubFetchMod._setFetchImplForTest(null);
+    process.env.EVOMAP_HUB_IP_FAMILY = 'ipv6';
+    assert.throws(
+      () => freshHubFetch(),
+      /EVOMAP_HUB_IP_FAMILY must be "ipv4", "ipv4-only", or "auto"/,
+    );
   });
 
   it('preserves existing options fields alongside dispatcher', async () => {

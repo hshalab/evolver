@@ -233,6 +233,56 @@ function _extractKeywordScore(lower) {
 var _llmSignalCycleCount = 0;
 var LLM_SIGNAL_INTERVAL = 5;
 
+function _curlHubIpFamilyArgs(env) {
+  return _curlHubIpFamilyAttempts(env)[0].slice();
+}
+
+function _resolveCurlHubIpFamily(env) {
+  var source = env || process.env;
+  var raw = String(source.EVOMAP_HUB_IP_FAMILY || 'ipv4first').trim().toLowerCase();
+  if (raw === 'ipv4' || raw === 'v4' || raw === '4' || raw === 'ipv4first' || raw === 'ipv4-first') return 'ipv4first';
+  if (raw === 'ipv4only' || raw === 'ipv4-only') return 'ipv4only';
+  if (raw === 'auto' || raw === 'dualstack' || raw === 'dual-stack') return 'auto';
+  throw new Error('[signals] EVOMAP_HUB_IP_FAMILY must be "ipv4", "ipv4-only", or "auto" - got ' + JSON.stringify(source.EVOMAP_HUB_IP_FAMILY));
+}
+
+function _curlHubIpFamilyAttempts(env) {
+  var family = _resolveCurlHubIpFamily(env);
+  if (family === 'auto') return [[]];
+  if (family === 'ipv4only') return [['-4']];
+  // Match hubFetch's default Hub egress posture: IPv4-first with a dual-stack
+  // fallback unless EVOMAP_HUB_IP_FAMILY explicitly disables fallback.
+  return [['-4'], []];
+}
+
+function _curlHeaderConfigValue(value) {
+  return '"' + String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t') + '"';
+}
+
+function _curlAuthConfig(nodeSecret) {
+  return 'header = ' + _curlHeaderConfigValue('Authorization: Bearer ' + nodeSecret) + '\n';
+}
+
+function _withTempPayloadFile(payload, fn) {
+  var fs = require('fs');
+  var os = require('os');
+  var path = require('path');
+  var dir = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-signal-'));
+  var file = path.join(dir, 'payload.json');
+  try {
+    fs.writeFileSync(file, payload, { encoding: 'utf8', mode: 0o600 });
+    return fn(file);
+  } finally {
+    try { fs.unlinkSync(file); } catch (_) {}
+    try { fs.rmdirSync(dir); } catch (_) {}
+  }
+}
+
 function _extractLLM(corpus) {
   _llmSignalCycleCount++;
   if (_llmSignalCycleCount % LLM_SIGNAL_INTERVAL !== 1) return [];
@@ -241,6 +291,7 @@ function _extractLLM(corpus) {
     var getHubUrl = require('./a2aProtocol').getHubUrl;
     var getHubNodeSecret = require('./a2aProtocol').getHubNodeSecret;
     var getNodeId = require('./a2aProtocol').getNodeId;
+    var enforceHubScheme = require('./hubFetch').enforceHubScheme;
     var hubUrl = getHubUrl();
     var nodeSecret = getHubNodeSecret();
     if (!hubUrl || !nodeSecret) return [];
@@ -252,27 +303,43 @@ function _extractLLM(corpus) {
       sender_id: getNodeId() || undefined,
     });
 
-    var url = hubUrl + '/a2a/signal/analyze';
+    var url = hubUrl.replace(/\/+$/, '') + '/a2a/signal/analyze';
+    enforceHubScheme(url);
 
-    // Use execFileSync (no shell) + curl argv array so postData/url/nodeSecret
-    // are passed as discrete argv entries. This eliminates any possibility of
-    // shell metacharacters in the corpus (which flows into postData) being
-    // interpreted by a shell. Sync HTTP is required because this runs inside
-    // a spin-wait loop where Node's async http callbacks cannot fire.
+    // Use execFileSync (no shell) + curl argv array so URL and file paths are
+    // passed as discrete argv entries. The bearer token is supplied through
+    // curl config on stdin, not argv, so process listings do not expose it.
+    // Sync HTTP is required because this runs inside a spin-wait loop where
+    // Node's async http callbacks cannot fire.
     var execFileSync = require('child_process').execFileSync;
     var stdout = '';
     try {
-      stdout = execFileSync('curl', [
-        '-s', '-m', '10', '-X', 'POST',
-        '-H', 'Content-Type: application/json',
-        '-H', 'Authorization: Bearer ' + nodeSecret,
-        '-d', postData,
-        url,
-      ], {
-        timeout: 12000,
-        windowsHide: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf8',
+      stdout = _withTempPayloadFile(postData, function (payloadFile) {
+        var attempts = _curlHubIpFamilyAttempts(process.env);
+        var lastErr = null;
+        for (var i = 0; i < attempts.length; i++) {
+          var curlArgs = [
+            '-sS', '-m', '10',
+          ].concat(attempts[i], [
+            '-X', 'POST',
+            '-H', 'Content-Type: application/json',
+            '--data-binary', '@' + payloadFile,
+            '-K', '-',
+            url,
+          ]);
+          try {
+            return execFileSync('curl', curlArgs, {
+              input: _curlAuthConfig(nodeSecret),
+              timeout: 12000,
+              windowsHide: true,
+              stdio: ['pipe', 'pipe', 'pipe'],
+              encoding: 'utf8',
+            });
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        throw lastErr || new Error('curl_failed');
       });
     } catch (_) {
       return [];
@@ -659,4 +726,5 @@ module.exports = {
   extractSignals, hasOpportunitySignal, analyzeRecentHistory,
   OPPORTUNITY_SIGNALS, SIGNAL_PROFILES,
   _extractRegex, _extractKeywordScore, _extractLLM, _mergeSignals,
+  _curlHubIpFamilyArgs, _curlHubIpFamilyAttempts, _curlAuthConfig,
 };

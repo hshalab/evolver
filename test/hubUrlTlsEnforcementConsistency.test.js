@@ -205,41 +205,25 @@ describe('strict TLS dispatcher / agent — defence against NODE_TLS_REJECT_UNAU
       'strictHttpsAgent must pin rejectUnauthorized=true so NODE_TLS_REJECT_UNAUTHORIZED=0 cannot weaken');
   });
 
-  it('atpExecute._postJson passes the strict https Agent for https URLs in secure mode', async () => {
-    // Spy on https.request to capture the options the inner function
-    // hands to Node. The actual network call is short-circuited by the
-    // spy returning a mock req object.
-    const https = require('https');
-    const { strictHttpsAgent } = require('../src/gep/hubFetch');
-    const origRequest = https.request;
+  it('atpExecute._postJson routes through hubFetch with strict dispatcher in secure mode', async () => {
+    const hubFetchMod = require('../src/gep/hubFetch');
     let capturedOpts = null;
-    https.request = function (opts, cb) {
+    hubFetchMod._setFetchImplForTest(async (_url, opts) => {
       capturedOpts = opts;
-      // Return a minimal req-like object so _postJson can attach
-      // listeners and call write/end without blowing up.
-      const fakeReq = {
-        on: () => fakeReq,
-        write: () => {},
-        end: () => {
-          // Resolve the response asynchronously with a 200.
-          setImmediate(() => cb({
-            statusCode: 200,
-            on: (evt, fn) => { if (evt === 'end') setImmediate(fn); return fakeReq; },
-          }));
-        },
-        destroy: () => {},
+      return {
+        ok: true,
+        status: 200,
+        text: async () => '{"payload":{"decision":"accept"}}',
+        json: async () => ({ ok: true }),
       };
-      return fakeReq;
-    };
-
+    });
     try {
-      await withEnv({ EVOMAP_HUB_ALLOW_INSECURE: undefined }, async () => {
+      await withEnv({
+        EVOMAP_HUB_ALLOW_INSECURE: undefined,
+        EVOMAP_PROXY: undefined,
+        A2A_TRANSPORT: undefined,
+      }, async () => {
         for (const k of Object.keys(require.cache)) {
-          // Do NOT clear hubFetch — its module-level singletons
-          // (strictHttpsAgent) are referenced by
-          // assertions outside the require chain, so a fresh require
-          // would produce different Agent instances and break the
-          // strictEqual identity check below.
           if (/[\\/]src[\\/]atp[\\/]/.test(k) ||
               /[\\/]src[\\/]gep[\\/](?!hubFetch)/.test(k)) {
             delete require.cache[k];
@@ -255,6 +239,11 @@ describe('strict TLS dispatcher / agent — defence against NODE_TLS_REJECT_UNAU
             buildHubHeaders: () => ({}),
             sendHelloToHub: async () => ({ ok: true }),
           },
+        };
+        const settingsPath = require.resolve('../src/proxy/server/settings');
+        require.cache[settingsPath] = {
+          id: settingsPath, filename: settingsPath, loaded: true,
+          exports: { getProxyUrl: () => null, getProxyToken: () => null },
         };
         const fs = require('fs');
         const os = require('os');
@@ -273,54 +262,39 @@ describe('strict TLS dispatcher / agent — defence against NODE_TLS_REJECT_UNAU
         }
       });
 
-      assert.ok(capturedOpts, 'https.request must have been invoked');
-      assert.ok(capturedOpts.agent, 'https.request options must carry an Agent in secure mode');
-      // Assert on the contract (rejectUnauthorized:true) rather than the
-      // Agent identity. Cache-clearing in surrounding tests can hand out
-      // a fresh Agent instance to the require chain that doesn't ===
-      // whatever this test captured at its top.
+      assert.ok(capturedOpts, 'hubFetch must have invoked the (stubbed) undici fetch');
+      assert.ok(capturedOpts.dispatcher, 'hubFetch must attach a dispatcher in secure mode');
       assert.equal(
-        capturedOpts.agent.options && capturedOpts.agent.options.rejectUnauthorized,
+        capturedOpts.dispatcher[Object.getOwnPropertySymbols(capturedOpts.dispatcher)
+          .find((s) => s.toString() === 'Symbol(options)')]
+          .connect.rejectUnauthorized,
         true,
-        'the Agent must pin rejectUnauthorized=true so NODE_TLS_REJECT_UNAUTHORIZED=0 cannot weaken it. Agent.options=' +
-        JSON.stringify(capturedOpts.agent.options),
+        'dispatcher must pin connect.rejectUnauthorized=true',
       );
     } finally {
-      https.request = origRequest;
+      hubFetchMod._setFetchImplForTest(null);
     }
   });
 
-  it('atpExecute._postJson does NOT pass the strict Agent under EVOMAP_HUB_ALLOW_INSECURE=1', async () => {
-    // Insecure mode is the documented escape hatch for local dev /
-    // self-signed mock hubs. Forcing strict cert verify there would
-    // break those workflows.
-    const https = require('https');
-    const origRequest = https.request;
+  it('atpExecute._postJson does NOT attach a dispatcher under EVOMAP_HUB_ALLOW_INSECURE=1', async () => {
+    const hubFetchMod = require('../src/gep/hubFetch');
     let capturedOpts = null;
-    https.request = function (opts, cb) {
+    hubFetchMod._setFetchImplForTest(async (_url, opts) => {
       capturedOpts = opts;
-      const fakeReq = {
-        on: () => fakeReq,
-        write: () => {},
-        end: () => {
-          setImmediate(() => cb({
-            statusCode: 200,
-            on: (evt, fn) => { if (evt === 'end') setImmediate(fn); return fakeReq; },
-          }));
-        },
-        destroy: () => {},
+      return {
+        ok: true,
+        status: 200,
+        text: async () => '{"payload":{"decision":"accept"}}',
+        json: async () => ({ ok: true }),
       };
-      return fakeReq;
-    };
-
+    });
     try {
-      await withEnv({ EVOMAP_HUB_ALLOW_INSECURE: '1' }, async () => {
+      await withEnv({
+        EVOMAP_HUB_ALLOW_INSECURE: '1',
+        EVOMAP_PROXY: undefined,
+        A2A_TRANSPORT: undefined,
+      }, async () => {
         for (const k of Object.keys(require.cache)) {
-          // Do NOT clear hubFetch — its module-level singletons
-          // (strictHttpsAgent) are referenced by
-          // assertions outside the require chain, so a fresh require
-          // would produce different Agent instances and break the
-          // strictEqual identity check below.
           if (/[\\/]src[\\/]atp[\\/]/.test(k) ||
               /[\\/]src[\\/]gep[\\/](?!hubFetch)/.test(k)) {
             delete require.cache[k];
@@ -336,6 +310,11 @@ describe('strict TLS dispatcher / agent — defence against NODE_TLS_REJECT_UNAU
             buildHubHeaders: () => ({}),
             sendHelloToHub: async () => ({ ok: true }),
           },
+        };
+        const settingsPath = require.resolve('../src/proxy/server/settings');
+        require.cache[settingsPath] = {
+          id: settingsPath, filename: settingsPath, loaded: true,
+          exports: { getProxyUrl: () => null, getProxyToken: () => null },
         };
         const fs = require('fs');
         const os = require('os');
@@ -354,11 +333,11 @@ describe('strict TLS dispatcher / agent — defence against NODE_TLS_REJECT_UNAU
         }
       });
 
-      assert.ok(capturedOpts, 'https.request must have been invoked');
-      assert.equal(capturedOpts.agent, undefined,
-        'under EVOMAP_HUB_ALLOW_INSECURE=1 the strict Agent must NOT be forced — local mock hubs with self-signed certs must keep working');
+      assert.ok(capturedOpts, 'fetch seam must have been called');
+      assert.equal(capturedOpts.dispatcher, undefined,
+        'under EVOMAP_HUB_ALLOW_INSECURE=1 hubFetch must NOT add the strict dispatcher');
     } finally {
-      https.request = origRequest;
+      hubFetchMod._setFetchImplForTest(null);
     }
   });
 

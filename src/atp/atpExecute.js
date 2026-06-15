@@ -22,12 +22,10 @@
 // idempotent server-side).
 
 const fs = require('fs');
-const http = require('http');
-const https = require('https');
 const crypto = require('crypto');
 
 const { computeAssetId } = require('../gep/contentHash');
-const { enforceHubScheme, strictHttpsAgent } = require('../gep/hubFetch');
+const { hubFetch } = require('../gep/hubFetch');
 const {
   getNodeId,
   getHubUrl,
@@ -126,77 +124,35 @@ function _publishUrl() {
   return base + '/a2a/publish';
 }
 
-function _postJson(urlStr, body, timeoutMs) {
-  return new Promise(function (resolve) {
-    // Same TLS posture as hubFetch: refuse plain http:// unless
-    // EVOMAP_HUB_ALLOW_INSECURE=1. Before this guard the function
-    // silently fell back to `lib = http` for any non-https URL, so an
-    // operator override `A2A_HUB_URL=http://...` would send /a2a/publish
-    // and /a2a/task/complete in cleartext while hubFetch-routed calls
-    // (e.g. /a2a/verify-solidify) refused the same URL — inconsistent
-    // TLS enforcement across modules.
-    try {
-      enforceHubScheme(urlStr);
-    } catch (e) {
-      resolve({ ok: false, error: 'tls_refused: ' + (e && e.message) });
-      return;
-    }
-    let parsed;
-    try {
-      parsed = new URL(urlStr);
-    } catch (e) {
-      resolve({ ok: false, error: 'invalid_url: ' + (e && e.message) });
-      return;
-    }
-    const isHttps = parsed.protocol === 'https:';
-    const lib = isHttps ? https : http;
-    const payload = JSON.stringify(body || {});
-    const headers = Object.assign(
-      { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-      buildHubHeaders() || {},
-    );
-    // Pin TLS cert verification for https calls so a globally-disabled
-    // NODE_TLS_REJECT_UNAUTHORIZED=0 cannot weaken the Hub channel
-    // (Cursor Security Reviewer #160 Medium). hubFetch enforces the
-    // same via its undici dispatcher; this is the Node-native-https
-    // equivalent.
-    //
-    // Skipped under EVOMAP_HUB_ALLOW_INSECURE=1 so local-dev / self-
-    // signed mock hubs that legitimately rely on
-    // NODE_TLS_REJECT_UNAUTHORIZED=0 still work.
-    const requestOpts = {
-      hostname: parsed.hostname,
-      port: parsed.port || (isHttps ? 443 : 80),
-      path: parsed.pathname + (parsed.search || ''),
+async function _postJson(urlStr, body, timeoutMs) {
+  const payload = JSON.stringify(body || {});
+  const headers = Object.assign(
+    { 'Content-Type': 'application/json' },
+    buildHubHeaders() || {},
+  );
+
+  try {
+    const res = await hubFetch(urlStr, {
       method: 'POST',
       headers: headers,
-      timeout: timeoutMs || PUBLISH_TIMEOUT_MS,
-    };
-    if (isHttps && process.env.EVOMAP_HUB_ALLOW_INSECURE !== '1') {
-      requestOpts.agent = strictHttpsAgent;
+      body: payload,
+      signal: AbortSignal.timeout(timeoutMs || PUBLISH_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
+    if (res.status >= 200 && res.status < 300) {
+      return { ok: true, status: res.status, data };
     }
-    const req = lib.request(
-      requestOpts,
-      function (res) {
-        const chunks = [];
-        res.on('data', function (c) { chunks.push(c); });
-        res.on('end', function () {
-          const text = Buffer.concat(chunks).toString('utf8');
-          let data = null;
-          try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({ ok: true, status: res.statusCode, data });
-          } else {
-            resolve({ ok: false, status: res.statusCode, data, error: 'http_' + res.statusCode });
-          }
-        });
-      },
-    );
-    req.on('timeout', function () { req.destroy(new Error('timeout')); });
-    req.on('error', function (err) { resolve({ ok: false, error: err.message }); });
-    req.write(payload);
-    req.end();
-  });
+    return { ok: false, status: res.status, data, error: 'http_' + res.status };
+  } catch (err) {
+    const msg = (err && err.message) || String(err);
+    if (msg.indexOf('[hubFetch]') !== -1) {
+      if (/not a valid URL/i.test(msg)) return { ok: false, error: 'invalid_url: ' + msg };
+      return { ok: false, error: 'tls_refused: ' + msg };
+    }
+    return { ok: false, error: msg };
+  }
 }
 
 async function _ensureNodeSecret() {

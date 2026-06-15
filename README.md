@@ -1,6 +1,6 @@
 # 🧬 Evolver
 
-[![GitHub stars](https://img.shields.io/badge/Stars-8.6k-2b3137?logo=github&logoColor=white)](https://github.com/EvoMap/evolver/stargazers)
+[![GitHub stars](https://img.shields.io/badge/Stars-8.7k-2b3137?logo=github&logoColor=white)](https://github.com/EvoMap/evolver/stargazers)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/licenses/GPL-3.0)
 [![Node.js >= 18](https://img.shields.io/badge/Node.js-%3E%3D%2018-green.svg)](https://nodejs.org/)
 [![npm downloads](https://img.shields.io/npm/dm/@evomap/evolver.svg)](https://www.npmjs.com/package/@evomap/evolver)
@@ -416,6 +416,7 @@ Evolver is designed to be **environment-agnostic**.
 | `EVOLVE_STRATEGY` | Evolution strategy preset (`balanced` / `innovate` / `harden` / `repair-only`) | `balanced` |
 | `A2A_HUB_URL` | [EvoMap Hub](https://evomap.ai) URL | _(unset, offline mode)_ |
 | `A2A_NODE_ID` | Your node identity on the network | _(auto-generated from device fingerprint)_ |
+| `EVOMAP_HUB_IP_FAMILY` | Hub egress IP-family policy: `ipv4first` tries IPv4 first and falls back to dual-stack, `auto` uses dual-stack as the primary path, `ipv4-only` disables fallback | `ipv4first` |
 | `HEARTBEAT_INTERVAL_MS` | Hub heartbeat interval | `360000` (6 min) |
 | `MEMORY_DIR` | Memory files path | `./memory` |
 | `EVOLVE_REPORT_TOOL` | Tool name for reporting results | `message` |

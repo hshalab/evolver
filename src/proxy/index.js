@@ -19,6 +19,7 @@ const { DmHandler } = require('./extensions/dmHandler');
 const { SessionHandler } = require('./extensions/sessionHandler');
 const { TraceControl } = require('./extensions/traceControl');
 const { backfillProxyTraceUploads } = require('./trace/extractor');
+const { hubFetch } = require('../gep/hubFetch');
 
 const TRACE_BACKFILL_DRAIN_MAX_PASSES = 8;
 const TRACE_BACKFILL_STARTUP_DRAIN_MAX_MS = 250;
@@ -282,6 +283,7 @@ class EvoMapProxy {
       // by whether the body carries a free-text `query` or a `signals` list.
       assetSearch: (body) => this._assetSearch(body),
       assetValidate: (body) => this._proxyHttp('/a2a/validate', this._wrapA2a('validate', body)),
+      assetPublish: (body) => this._assetPublish(body),
       // ATP passthrough (#460 Bug 2): merchant/consumer flows that used to call
       // hub directly via src/atp/hubClient.js must route through the proxy when
       // EVOMAP_PROXY=1 so proxy sees the transaction (for audit + offline queue).
@@ -539,7 +541,7 @@ class EvoMapProxy {
       init.body = JSON.stringify(body || {});
     }
 
-    const res = await fetch(endpoint, init);
+    const res = await hubFetch(endpoint, init);
 
     if (res.status === 403 || res.status === 401) {
       const recovered = await this.lifecycle.reAuthenticate();
@@ -552,7 +554,7 @@ class EvoMapProxy {
         if (method !== 'GET' && method !== 'HEAD') {
           retryInit.body = JSON.stringify(body || {});
         }
-        const retry = await fetch(endpoint, retryInit);
+        const retry = await hubFetch(endpoint, retryInit);
         if (!retry.ok) {
           const text = await retry.text().catch(() => '');
           throw Object.assign(new Error(`Hub ${retry.status}: ${text}`), { statusCode: retry.status });
@@ -661,6 +663,101 @@ class EvoMapProxy {
 
     this._searchInflight.set(key, p);
     return p;
+  }
+
+  // Cross-agent / MCP publish. The legacy `evolver_publish_asset` path queued
+  // an `asset_submit` mailbox message, but the Hub gated that off
+  // (A2A_MAILBOX_ASSET_SUBMIT_ENABLED) and now enforces signed Gene+Capsule
+  // bundles on POST /a2a/publish. Route loose asset submits through
+  // buildPublishBundle so publishing actually reaches the Hub (single-asset
+  // publish is rejected; the Hub quarantines new bundles for safety review).
+  async _assetPublish(body) {
+    const a2a = require('../gep/a2aProtocol');
+    const nodeId = this.store && this.store.getState && this.store.getState('node_id');
+    const rawAssets = Array.isArray(body.assets) ? body.assets : (body.asset ? [body.asset] : []);
+    if (rawAssets.length === 0) {
+      throw Object.assign(new Error('assets is required'), { statusCode: 400 });
+    }
+    const results = [];
+    for (const raw of rawAssets) {
+      try {
+        const { gene, capsule } = this._buildBundleFromLooseAsset(raw);
+        const msg = a2a.buildPublishBundle({ gene, capsule, nodeId });
+        const res = await this._proxyHttp('/a2a/publish', msg);
+        results.push({ ok: true, gene_asset_id: gene.asset_id, capsule_asset_id: capsule.asset_id, response: res });
+      } catch (err) {
+        results.push({ ok: false, error: err.message, statusCode: err.statusCode });
+      }
+    }
+    return { published: results.filter(r => r.ok).length, total: results.length, results };
+  }
+
+  // Build a Hub-valid Gene+Capsule bundle from a loose MCP asset
+  // ({type, content, summary, signals}). The Hub quality-gates genes (strategy
+  // >=2 steps >=15 chars; sandboxable `node -e` validation) and requires a
+  // companion capsule carrying substantive content; fill the structural
+  // defaults and map the caller's content into strategy/content. Caller-
+  // supplied strategy/validation/category/outcome win when present.
+  _buildBundleFromLooseAsset(raw) {
+    const crypto = require('crypto');
+    const { SCHEMA_VERSION } = require('../gep/contentHash');
+    const r = raw || {};
+    const text = String(r.content || r.summary || '').trim();
+    const signals = (Array.isArray(r.signals) && r.signals.length) ? r.signals
+      : (Array.isArray(r.signals_match) && r.signals_match.length) ? r.signals_match : ['user_request'];
+    // Gene strategy: the Hub requires >=2 actionable steps, each >=15 chars.
+    // Enforce upfront (clean 400) rather than letting the Hub reject the publish.
+    // Bugbot #256: caller-supplied short steps and a sub-50-char capsule content
+    // previously slipped past the proxy and got rejected at the Hub instead.
+    let strategy;
+    if (Array.isArray(r.strategy) && r.strategy.length) {
+      strategy = r.strategy.map((s) => String(s).trim()).filter((s) => s.length >= 15);
+      if (strategy.length < 2) {
+        throw Object.assign(new Error('publish: `strategy` needs >=2 steps, each >=15 chars (Hub quality gate).'), { statusCode: 400 });
+      }
+    } else {
+      const steps = text.split(/[.\n;]+/).map((s) => s.trim()).filter((s) => s.length >= 15);
+      if (steps.length >= 2) {
+        strategy = steps.slice(0, 8);
+      } else if (text.length >= 50) {
+        strategy = [text.slice(0, 200), 'Validate the result before adopting the change'];
+      } else {
+        throw Object.assign(new Error('publish: provide `content` (>=50 chars) or a `strategy` of >=2 steps (each >=15 chars); the Hub quality-gates published genes.'), { statusCode: 400 });
+      }
+    }
+    const VALID_CATEGORIES = ['repair', 'optimize', 'innovate', 'explore'];
+    const schemaVersion = r.schema_version || SCHEMA_VERSION;
+    const gid = r.gene_id || ('mcp_g_' + crypto.randomBytes(6).toString('hex'));
+    const summary = r.summary || text.slice(0, 120) || 'manually published asset';
+    // Capsule needs >=50 chars of substance (Hub gate); guarantee it upfront.
+    const capsuleContent = text.length >= 50 ? text : (summary + ' — ' + strategy.join(' ')).trim();
+    if (capsuleContent.length < 50) {
+      throw Object.assign(new Error('publish: capsule content resolves to <50 chars; provide a longer `content` or `summary`.'), { statusCode: 400 });
+    }
+    const gene = {
+      type: 'Gene', schema_version: schemaVersion, id: gid,
+      category: VALID_CATEGORIES.includes(r.category) ? r.category : 'explore',
+      summary,
+      signals_match: signals,
+      strategy,
+      constraints: (r.constraints && typeof r.constraints === 'object') ? r.constraints : { max_files: 50, forbidden_paths: [] },
+      validation: (Array.isArray(r.validation) && r.validation.length) ? r.validation : ['node -e "if (![1].length) process.exit(1)"'],
+    };
+    const capsule = {
+      type: 'Capsule', schema_version: schemaVersion, id: 'mcp_c_' + crypto.randomBytes(6).toString('hex'),
+      trigger: signals, gene: gid, summary,
+      confidence: typeof r.confidence === 'number' ? r.confidence : 0.5,
+      blast_radius: { files: 1, lines: 1 },
+      env_fingerprint: { platform: process.platform, arch: process.arch },
+      outcome: (r.outcome && typeof r.outcome === 'object' && r.outcome.status) ? r.outcome : { status: 'success', score: 0.5 },
+      content: capsuleContent,
+    };
+    // Redact PII/secrets before publish (Bugbot #256 High). Without client-side
+    // sanitize, the Hub's server-side redaction rewrites the body and recomputes
+    // a divergent asset_id, causing persistent roundtrip_missing. Sanitize before
+    // buildPublishBundle stamps asset_id. Mirrors skill2gep's publish path.
+    const { sanitizePayload } = require('../gep/sanitize');
+    return { gene: sanitizePayload(gene), capsule: sanitizePayload(capsule) };
   }
 
   // Phase C slice 4 + token mediation: relay to api.anthropic.com. The
@@ -1204,7 +1301,7 @@ class EvoMapProxy {
     if (!nodeId) return { error: 'No node_id yet' };
     const endpoint = `${this.hubUrl}/a2a/mailbox/status?node_id=${encodeURIComponent(nodeId)}`;
     try {
-      const res = await fetch(endpoint, {
+      const res = await hubFetch(endpoint, {
         method: 'GET',
         headers: this.lifecycle._buildHeaders(),
         signal: AbortSignal.timeout(10_000),

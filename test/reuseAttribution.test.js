@@ -11,7 +11,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const ENV = ['EVOLUTION_DIR', 'MEMORY_DIR', 'EVOLVER_REPO_ROOT', 'EVOLVER_REUSE_ATTRIBUTION', 'MEMORY_GRAPH_SYNC_HUB', 'A2A_HUB_URL'];
+const ENV = ['EVOLUTION_DIR', 'MEMORY_DIR', 'EVOLVER_REPO_ROOT', 'EVOLVER_REUSE_ATTRIBUTION', 'MEMORY_GRAPH_SYNC_HUB', 'A2A_HUB_URL', 'EVOLVER_OUTCOME_REPORT', 'EVOMAP_HUB_ALLOW_INSECURE', 'A2A_NODE_SECRET'];
 
 function fresh(p) { const r = require.resolve(p); delete require.cache[r]; return require(r); }
 function reloadAll() {
@@ -196,6 +196,76 @@ describe('P4-a Slice A — reuse attribution', () => {
       assert.equal(idx['A'], 1200);
       assert.ok(!('B' in idx));
       assert.ok(!('C' in idx));
+    });
+  });
+
+  // P4-a Slice B (client side): opt-in Hub outcome report. Drives the REAL wiring
+  // through recordOutcomeFromState and asserts the best-effort POST (stubbed
+  // global.fetch via the insecure path, mirroring test/hubEvents.test.js).
+  describe('P4-a Slice B — Hub outcome report (EVOLVER_OUTCOME_REPORT, opt-in)', () => {
+    let savedFetch, calls;
+    beforeEach(() => {
+      savedFetch = global.fetch;
+      calls = [];
+      global.fetch = async (url, opts) => {
+        calls.push({ url: String(url), opts });
+        return { ok: true, status: 200, json: async () => ({ recorded: true }), text: async () => '' };
+      };
+      process.env.A2A_HUB_URL = 'http://localhost:19997';
+      process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
+      process.env.A2A_NODE_SECRET = 'test_secret';
+      process.env.EVOLVER_REUSE_ATTRIBUTION = 'shadow'; // builds the attribution this consumes
+    });
+    afterEach(() => { global.fetch = savedFetch; });
+    const flush = () => new Promise((r) => setImmediate(r));
+    const records = () => calls.filter((c) => c.url.includes('/a2a/memory/record'));
+
+    it('flag default off: shadow + direct reuse does NOT POST to the Hub', async () => {
+      writeRunState({ source_type: 'reused', reused_asset_id: 'sha256:abc' });
+      writeLastAction();
+      fresh('../src/gep/memoryGraph').recordOutcomeFromState({ signals: [], observations: null });
+      await flush();
+      assert.equal(records().length, 0, 'no POST when EVOLVER_OUTCOME_REPORT is off');
+    });
+
+    it('flag on + shadow + direct reuse: POSTs flat {signals,status,used_asset_ids} to /a2a/memory/record', async () => {
+      process.env.EVOLVER_OUTCOME_REPORT = 'on';
+      writeRunState({ source_type: 'reused', reused_asset_id: 'sha256:abc' });
+      writeLastAction(); // last_action.had_error:true, signals:['log_error']
+      // current signals empty => error cleared => status 'success' (not stable_no_error)
+      fresh('../src/gep/memoryGraph').recordOutcomeFromState({ signals: [], observations: null });
+      await flush();
+      const rec = records()[0];
+      assert.ok(rec, 'POST to /a2a/memory/record fired');
+      const body = JSON.parse(rec.opts.body);
+      assert.deepEqual(body.used_asset_ids, ['sha256:abc']);
+      assert.equal(body.status, 'success');
+      assert.ok(Array.isArray(body.signals) && body.signals.length > 0, 'non-empty signals');
+      // The hub resolves the recording node from body.sender_id (the node_secret
+      // only authenticates that id, never derives it). Without sender_id the
+      // record 400s with "sender_id_required" and this best-effort reporter
+      // silently drops it — so this is the regression guard for that bug.
+      assert.ok(typeof body.sender_id === 'string' && body.sender_id.length > 0,
+        'flat body MUST carry sender_id so the hub can resolve the recording node');
+      assert.ok(!('event' in body), 'still flat — not the {sender_id, event} memory-event envelope');
+      assert.equal(rec.opts.headers.Authorization, 'Bearer test_secret');
+    });
+
+    it('flag on + reference (not direct reuse): no POST (reference is the weaker signal)', async () => {
+      process.env.EVOLVER_OUTCOME_REPORT = 'on';
+      writeRunState({ source_type: 'reference', reused_asset_id: 'sha256:ref1' });
+      writeLastAction();
+      fresh('../src/gep/memoryGraph').recordOutcomeFromState({ signals: [], observations: null });
+      await flush();
+      assert.equal(records().length, 0, 'reference reuse must not claim used_asset_ids');
+    });
+
+    it('flag on but no run-state (no reuse this cycle): no POST', async () => {
+      process.env.EVOLVER_OUTCOME_REPORT = 'on';
+      writeLastAction(); // no evolution_solidify_state.json
+      fresh('../src/gep/memoryGraph').recordOutcomeFromState({ signals: [], observations: null });
+      await flush();
+      assert.equal(records().length, 0, 'no reuse => nothing to report');
     });
   });
 });

@@ -65,6 +65,11 @@ describe('ProxyHttpServer', () => {
       assetFetch: async (body) => ({ assets: [], query: body }),
       assetSearch: async (body) => ({ results: [], query: body }),
       assetValidate: async (body) => ({ valid: true, asset_id: body.asset_id || 'test' }),
+      assetPublish: async (body) => ({
+        published: (body.assets || []).length,
+        total: (body.assets || []).length,
+        results: (body.assets || []).map(() => ({ ok: true, gene_asset_id: 'sha256:test', capsule_asset_id: 'sha256:test' })),
+      }),
     };
 
     const routes = buildRoutes(store, mockProxyHandlers, null, {});
@@ -168,12 +173,15 @@ describe('ProxyHttpServer', () => {
   });
 
   describe('POST /asset/submit', () => {
-    it('queues asset submission via mailbox', async () => {
+    it('publishes asset submission via the /a2a/publish bundle path', async () => {
       const res = await authedReq(`${baseUrl}/asset/submit`, 'POST', {
         assets: [{ type: 'Gene', content: 'test' }],
       });
       assert.equal(res.status, 200);
-      assert.ok(res.body.message_id);
+      // No longer the gated mailbox path (which returned a queued message_id);
+      // routes through proxyHandlers.assetPublish → POST /a2a/publish.
+      assert.equal(res.body.published, 1);
+      assert.ok(Array.isArray(res.body.results));
     });
 
     it('rejects missing assets and asset_id', async () => {
@@ -416,5 +424,54 @@ describe('ProxyHttpServer', () => {
       assert.ok(res.status === 200 || res.status === 201,
         'small bodies must still pass: got ' + res.status);
     });
+  });
+});
+
+describe('EvoMapProxy._buildBundleFromLooseAsset', () => {
+  const { EvoMapProxy } = require('../src/proxy');
+  const build = (raw) => EvoMapProxy.prototype._buildBundleFromLooseAsset.call({}, raw);
+
+  it('turns a loose MCP asset into a Hub-valid Gene+Capsule bundle', () => {
+    const { gene, capsule } = build({
+      type: 'Gene',
+      content: 'A reusable approach long enough to clear the fifty character substance minimum the Hub enforces on assets.',
+      signals: ['test_failure'],
+    });
+    assert.equal(gene.type, 'Gene');
+    assert.ok(gene.strategy.length >= 2, 'gene strategy needs >=2 steps');
+    assert.match(gene.validation[0], /^node |^npm |^npx /, 'validation must be node/npm/npx');
+    assert.doesNotMatch(gene.validation[0], /process\.exit\(0\)/, 'validation must be a real assertion');
+    assert.equal(capsule.gene, gene.id, 'capsule references the gene');
+    assert.ok(Array.isArray(capsule.trigger), 'capsule trigger is an array');
+    assert.ok(capsule.blast_radius.files >= 1 && capsule.blast_radius.lines >= 1);
+    assert.ok(capsule.env_fingerprint.platform && capsule.env_fingerprint.arch);
+    assert.ok(capsule.content.length >= 50, 'capsule needs >=50 chars of substance');
+  });
+
+  it('rejects an asset with no substantive content', () => {
+    assert.throws(() => build({ type: 'Gene', summary: 'too short' }), /content|strategy/);
+  });
+
+  it('preserves caller-supplied strategy and category', () => {
+    const { gene } = build({
+      type: 'Gene', category: 'optimize',
+      strategy: ['Step one that is long enough to count', 'Step two that is also long enough to count'],
+      signals: ['perf_bottleneck'],
+    });
+    assert.equal(gene.category, 'optimize');
+    assert.equal(gene.strategy.length, 2);
+    assert.deepEqual(gene.signals_match, ['perf_bottleneck']);
+  });
+
+  it('rejects caller strategy whose steps are under 15 chars (Hub gate)', () => {
+    assert.throws(() => build({ type: 'Gene', strategy: ['short', 'tiny'], signals: ['x'] }), /strategy.*15 chars/);
+  });
+
+  it('rejects when capsule content resolves below 50 chars', () => {
+    // strategy passes (2 steps >=15 chars) but summary + steps still < 50 chars.
+    assert.throws(
+      () => build({ type: 'Gene', summary: 'hi', strategy: ['aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb'] }),
+      /content resolves to <50|50 chars/,
+    );
   });
 });

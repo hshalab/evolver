@@ -8,8 +8,6 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const https = require('https');
-const http = require('http');
 const { spawnSync } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
 // on large repos). See GHSA reports / issue #451.
@@ -113,15 +111,17 @@ function detectSignals(text) {
   return [...new Set(signals)];
 }
 
-function recordToHub(outcome) {
+function loadHubFetch() {
+  const evolverRoot = findEvolverRoot();
+  return require(path.join(evolverRoot, 'src', 'gep', 'hubFetch')).hubFetch;
+}
+
+async function recordToHub(outcome) {
   const hubUrl = process.env.EVOMAP_HUB_URL || process.env.A2A_HUB_URL;
   const apiKey = process.env.EVOMAP_API_KEY || process.env.A2A_NODE_SECRET;
   const nodeId = process.env.EVOMAP_NODE_ID || process.env.A2A_NODE_ID;
   if (!hubUrl || !apiKey) return false;
 
-  // Use Node.js built-in http/https instead of curl so this works on all
-  // platforms, including Windows where curl may not be available or may be
-  // an older, incompatible version bundled with some environments.
   try {
     const payload = JSON.stringify({
       gene_id: outcome.geneId || 'ad_hoc',
@@ -133,37 +133,18 @@ function recordToHub(outcome) {
     });
 
     const endpoint = hubUrl.replace(/\/+$/, '') + '/a2a/evolution/record';
-    let parsedUrl;
-    try { parsedUrl = new URL(endpoint); } catch { return false; }
-
-    const isHttps = parsedUrl.protocol === 'https:';
-    const transport = isHttps ? https : http;
-
-    return new Promise((resolve) => {
-      const req = transport.request(
-        {
-          hostname: parsedUrl.hostname,
-          port: parsedUrl.port || (isHttps ? 443 : 80),
-          path: parsedUrl.pathname + (parsedUrl.search || ''),
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Length': Buffer.byteLength(payload),
-          },
-          timeout: 8000,
-        },
-        (res) => {
-          // Drain the response to free the socket; we only care about status.
-          res.resume();
-          resolve(res.statusCode >= 200 && res.statusCode < 300);
-        }
-      );
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
-      req.write(payload);
-      req.end();
+    const hubFetch = loadHubFetch();
+    const res = await hubFetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: payload,
+      signal: AbortSignal.timeout(8000),
     });
+    try { await res.text(); } catch (_) {}
+    return res.ok;
   } catch {
     return false;
   }
@@ -250,7 +231,7 @@ function main() {
   process.stdin.on('data', chunk => { inputData += chunk; });
   process.stdin.on('end', () => {
     if (handled) return;
-    // recordToHub is async (uses Node.js http/https); wrap the rest of the
+    // recordToHub is async (uses the shared Hub fetch transport); wrap the rest of the
     // handler in an immediately-invoked async function so we can await it
     // while still honouring the watchdog timeout and the `handled` guard.
     (async () => {

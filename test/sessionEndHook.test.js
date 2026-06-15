@@ -292,3 +292,12 @@ describe('evolver-session-end cwd tag consistency (reader/writer match)', () => 
     } finally { cleanup(repo); cleanup(elsewhere); cleanup(home); }
   });
 });
+
+describe('evolver-session-end Hub egress', () => {
+  it('records to Hub through the shared hubFetch transport', () => {
+    const src = fs.readFileSync(scriptPath, 'utf8');
+    assert.match(src, /hubFetch/, 'Hub recording must use hubFetch');
+    assert.ok(!/require\(['"]https?['"]\)/.test(src), 'must not import native http/https for Hub egress');
+    assert.ok(!/\bhttps?\.request\s*\(/.test(src), 'must not open native Hub sockets directly');
+  });
+});

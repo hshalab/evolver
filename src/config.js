@@ -202,6 +202,20 @@ function reuseAttributionMode() {
   return v === 'shadow' ? 'shadow' : 'off';
 }
 
+// Opt-in Hub reuse-OUTCOME reporting (P4-a Slice B, client side). When 'on', the
+// evolver POSTs {signals, status, used_asset_ids} to the Hub's /a2a/memory/record
+// so the reuse-reward attribution pipeline (which reads THAT endpoint, not the
+// inert reuse_attribution blob on /a2a/memory/event) finally gets data.
+// MONEY-ADJACENT and charges Hub credits -> default 'off'. The Hub still
+// re-verifies every used_asset_id against its own AssetFetcher rows before
+// crediting. Also requires EVOLVER_REUSE_ATTRIBUTION=shadow, which is what builds
+// the cycle-correlated, timestamp-guarded attribution this report consumes.
+const OUTCOME_REPORT_MODE = envStr('EVOLVER_OUTCOME_REPORT', 'off');
+function outcomeReportMode() {
+  const v = String(process.env.EVOLVER_OUTCOME_REPORT || OUTCOME_REPORT_MODE || 'off').toLowerCase().trim();
+  return v === 'on' || v === 'enforce' || v === 'true' ? 'on' : 'off';
+}
+
 // --- Anti-abuse telemetry (privacy-preserving heartbeat summary) ---
 // Enabled by default. In heartbeat mode, clients attach a small
 // `meta.anti_abuse` envelope with low-sensitive hashes, source-confidence
@@ -306,6 +320,9 @@ module.exports = {
   // Reuse attribution (P4-a Slice A)
   REUSE_ATTRIBUTION_MODE,
   reuseAttributionMode,
+  // Reuse-outcome Hub reporting (P4-a Slice B, opt-in)
+  OUTCOME_REPORT_MODE,
+  outcomeReportMode,
   // Anti-abuse telemetry
   ANTI_ABUSE_TELEMETRY_MODE,
   antiAbuseTelemetryMode,

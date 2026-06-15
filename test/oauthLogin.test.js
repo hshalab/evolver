@@ -19,20 +19,20 @@ function load() {
   return require('../src/gep/oauthLogin');
 }
 
-function stubFetch(routes) {
-  const orig = global.fetch;
-  global.fetch = async (url) => {
-    const body = routes(url);
+function stubHubFetch(routes) {
+  const hubFetchMod = require('../src/gep/hubFetch');
+  hubFetchMod._setFetchImplForTest(async (url, init) => {
+    const body = routes(url, init || {});
     return { status: body.status || 200, json: async () => body.json };
-  };
-  return () => { global.fetch = orig; };
+  });
+  return () => { hubFetchMod._setFetchImplForTest(null); };
 }
 
 test('deviceLogin: device_authorization -> poll (pending then token) -> persists', async () => {
   tmpHome();
   const m = load();
   let polls = 0;
-  const restore = stubFetch((url) => {
+  const restore = stubHubFetch((url) => {
     if (url.endsWith('/oauth/device_authorization')) {
       return { status: 200, json: { device_code: 'DC', user_code: 'AB12-CD34', verification_uri: 'https://evomap.ai/device', interval: 1 } };
     }
@@ -70,10 +70,12 @@ test('refreshOAuthToken: uses refresh_token grant, updates stored token', async 
   m.saveOAuthToken({ access_token: 'AT1', refresh_token: 'RT1', expires_at: Date.now() + 1000 });
   let sentGrant = null;
   let sentRefresh = null;
-  const restore = stubFetch(() => ({ status: 200, json: { access_token: 'AT2', refresh_token: 'RT2', expires_in: 3600 } }));
-  // wrap to capture body
-  const origFetch = global.fetch;
-  global.fetch = async (url, init) => { const b = JSON.parse(init.body); sentGrant = b.grant_type; sentRefresh = b.refresh_token; return origFetch(url, init); };
+  const restore = stubHubFetch((_url, init) => {
+    const b = JSON.parse(init.body);
+    sentGrant = b.grant_type;
+    sentRefresh = b.refresh_token;
+    return { status: 200, json: { access_token: 'AT2', refresh_token: 'RT2', expires_in: 3600 } };
+  });
   try {
     const at = await m.refreshOAuthToken({ hubUrl: 'https://hub.test' });
     assert.equal(at, 'AT2');
@@ -82,6 +84,30 @@ test('refreshOAuthToken: uses refresh_token grant, updates stored token', async 
     assert.equal(m.loadOAuthToken().access_token, 'AT2');
   } finally {
     restore();
+  }
+});
+
+test('refreshOAuthToken: refuses http hub URL before sending refresh token', async () => {
+  tmpHome();
+  const origInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
+  delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+  const m = load();
+  m.saveOAuthToken({ access_token: 'AT1', refresh_token: 'RT1', expires_at: Date.now() + 1000 });
+  let called = false;
+  const restore = stubHubFetch(() => {
+    called = true;
+    return { status: 200, json: { access_token: 'AT2', expires_in: 3600 } };
+  });
+  try {
+    await assert.rejects(
+      () => m.refreshOAuthToken({ hubUrl: 'http://hub.test' }),
+      /must use https/i,
+    );
+    assert.equal(called, false, 'refresh token must not be sent after URL-scheme refusal');
+  } finally {
+    restore();
+    if (origInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    else process.env.EVOMAP_HUB_ALLOW_INSECURE = origInsecure;
   }
 });
 
@@ -105,7 +131,7 @@ test('startTokenAutoRefresh: schedules ~2min before expiry, refreshes, reschedul
   let scheduledDelay = null;
   let firedFn = null;
   const fakeSetTimer = (fn, ms) => { scheduledDelay = ms; firedFn = fn; return { unref() {} }; };
-  const restore = stubFetch(() => ({ status: 200, json: { access_token: 'AT2', refresh_token: 'RT2', expires_in: 3600 } }));
+  const restore = stubHubFetch(() => ({ status: 200, json: { access_token: 'AT2', refresh_token: 'RT2', expires_in: 3600 } }));
   try {
     const stop = m.startTokenAutoRefresh({ setTimer: fakeSetTimer, clearTimer: () => {}, now: () => now });
     // ~ (3600_000 - 2*60_000) = 3_480_000 ms before expiry
