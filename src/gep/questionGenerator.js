@@ -19,8 +19,30 @@ const { getEvolutionDir } = require('./paths');
 const QUESTION_STATE_FILE = path.join(getEvolutionDir(), 'question_generator_state.json');
 const MIN_INTERVAL_MS = 30 * 60 * 1000; // standard path: at most once per 30 minutes
 const URGENT_INTERVAL_MS = 5 * 60 * 1000; // urgent path: at most once per 5 minutes
+const EXPLORE_INTERVAL_MS = 6 * 60 * 60 * 1000; // exploration path: at most once per 6 hours
 const MAX_QUESTIONS_PER_CYCLE = 3;
 const MAX_URGENT_QUESTIONS = 2;
+
+// Problem-signal triggers used by the standard strategies. Their presence means
+// the agent is "stuck"; the exploration (healthy-agent) strategy stays out of
+// the way when any of these fire, and is filtered out of a question's topic
+// anchor so a curiosity question never reads like a distress signal.
+var PROBLEM_SIGNALS = [
+  'recurring_error', 'high_failure_ratio', 'capability_gap', 'unsupported_input_type',
+  'evolution_saturation', 'force_steady_state', 'consecutive_failure_streak',
+  'user_feature_request', 'perf_bottleneck', 'hub_search_miss_with_problem',
+  'repair_loop_detected', 'force_innovation_after_repair_loop',
+  'plateau_pivot_required', 'plateau_pivot_suggested',
+];
+
+// Common words stripped before ranking topic keywords for exploration questions.
+var EXPLORE_STOPWORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'what', 'your',
+  'agent', 'about', 'into', 'then', 'than', 'they', 'them', 'their', 'there',
+  'here', 'will', 'would', 'could', 'should', 'been', 'were', 'using', 'used',
+  'cycle', 'evolution', 'error', 'errors', 'failed', 'failure', 'null', 'undefined',
+  'true', 'false', 'console', 'return', 'function', 'const', 'value', 'result',
+]);
 
 // Infrastructure / user-local failures that the ecosystem cannot resolve.
 // Keep in sync with the hub-side bounty spam guard so the two gates never
@@ -82,6 +104,64 @@ function extractRecentGeneIds(recentEvents, count) {
     if (Array.isArray(genes) && genes.length > 0) ids.push(genes[0]);
   }
   return Array.from(new Set(ids));
+}
+
+// Pull a few salient domain keywords from the agent's recent work (session
+// transcript + memory). Deterministic frequency ranking, no NLP dependency.
+// Returns up to `max` distinctive lowercase terms, or [] when there is nothing
+// substantive -- used to ground exploration questions in the agent's real
+// activity so they are specific (and clear the hub relevance gate), not generic.
+function extractTopicKeywords(transcript, memory, max) {
+  var text = (String(transcript || '') + ' ' + String(memory || '')).toLowerCase();
+  var words = text.match(/[a-z][a-z0-9_-]{4,}/g) || [];
+  var freq = {};
+  for (var i = 0; i < words.length; i++) {
+    var w = words[i];
+    if (EXPLORE_STOPWORDS.has(w)) continue;
+    freq[w] = (freq[w] || 0) + 1;
+  }
+  var ranked = Object.keys(freq)
+    .filter(function (w) { return freq[w] >= 2; })
+    .sort(function (a, b) { return freq[b] - freq[a]; });
+  return ranked.slice(0, max || 5);
+}
+
+// Exploration strategy: a healthy, productively-running agent proactively asks
+// the network how to extend itself -- complementary capabilities, reusable
+// patterns, or adjacent high-value problems. This is the path that keeps organic
+// bounty demand flowing when no problem signals are firing (problem strategies
+// only fire when the agent is stuck). Anchored on the agent's real recent work
+// so the question is specific, not noise; returns null when there is no anchor.
+function buildExplorationCandidate(signals, recentEvents, transcript, memory) {
+  var topicSignals = (signals || []).filter(function (s) {
+    s = String(s || '');
+    if (!/^[a-z][a-z0-9_]{3,40}$/i.test(s)) return false;
+    if (s.indexOf('errsig') === 0 || s.indexOf('ban_gene') === 0 || s.indexOf('recurring_') === 0) return false;
+    return !PROBLEM_SIGNALS.some(function (p) { return s === p || s.indexOf(p) === 0; });
+  }).slice(0, 4);
+
+  var keywords = extractTopicKeywords(transcript, memory, 5);
+  var genes = extractRecentGeneIds(recentEvents, 5);
+
+  // Require real work artifacts (domain keywords from the transcript/memory, or
+  // recent genes) to ground the question. A bare signal name is too thin an
+  // anchor to make a useful bounty, so topic signals only enrich the tags.
+  if (keywords.length === 0 && genes.length === 0) return null;
+
+  var focus = keywords.length > 0 ? keywords.slice(0, 5).join(', ') : genes.join(', ');
+  var question = 'A productively-running agent working on ' + focus
+    + ' wants to extend its capabilities. What reusable patterns, automation genes, '
+    + 'or complementary tools in this area would be most valuable to build next, and '
+    + 'what adjacent high-value problems is the ecosystem not yet solving well here?';
+
+  return {
+    question: question,
+    amount: 0,
+    signals: ['capability_frontier', 'exploration', 'proactive_curiosity']
+      .concat(keywords.slice(0, 2))
+      .concat(topicSignals.slice(0, 2)),
+    priority: 0,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +403,21 @@ function generateQuestions(opts) {
   }
 
   var candidates = buildStandardCandidates(signals, recentEvents, transcript, memory);
+
+  // Exploration (healthy-agent) path: add a low-priority proactive question on a
+  // slower cadence (EXPLORE_INTERVAL_MS) so a smoothly-running agent -- which
+  // trips none of the problem strategies above -- still seeds organic bounty
+  // demand. Disable with EVOLVER_EXPLORATION_QUESTIONS=0.
+  var exploreEligible = process.env.EVOLVER_EXPLORATION_QUESTIONS !== '0';
+  if (exploreEligible && state.lastExploreAt) {
+    var exElapsed = Date.now() - new Date(state.lastExploreAt).getTime();
+    if (exElapsed < EXPLORE_INTERVAL_MS) exploreEligible = false;
+  }
+  if (exploreEligible) {
+    var exploration = buildExplorationCandidate(signals, recentEvents, transcript, memory);
+    if (exploration) candidates.push(exploration);
+  }
+
   if (candidates.length === 0) return [];
 
   candidates.sort(function(a, b) { return b.priority - a.priority; });
@@ -337,6 +432,12 @@ function generateQuestions(opts) {
 
   if (filtered.length === 0) return [];
 
+  // Advance the exploration cooldown only if an exploration question actually
+  // went out, so problem questions never consume the slower exploration budget.
+  var explorationSent = filtered.some(function (q) {
+    return Array.isArray(q.signals) && q.signals.indexOf('exploration') !== -1;
+  });
+
   var newRecentQuestions = recentQTexts.concat(filtered.map(function(q) { return q.question; }));
   if (newRecentQuestions.length > 30) {
     newRecentQuestions = newRecentQuestions.slice(-30);
@@ -344,6 +445,7 @@ function generateQuestions(opts) {
   writeState({
     lastAskedAt: new Date().toISOString(),
     lastUrgentAt: state.lastUrgentAt || null,
+    lastExploreAt: explorationSent ? new Date().toISOString() : (state.lastExploreAt || null),
     recentQuestions: newRecentQuestions,
   });
 
@@ -404,6 +506,7 @@ function generateUrgentQuestions(opts) {
   writeState({
     lastAskedAt: state.lastAskedAt || null,
     lastUrgentAt: new Date().toISOString(),
+    lastExploreAt: state.lastExploreAt || null,
     recentQuestions: newRecentQuestions,
   });
 

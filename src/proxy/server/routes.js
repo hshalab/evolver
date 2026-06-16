@@ -100,6 +100,29 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
       return { body: result };
     },
 
+    'POST /conversation/distill': async ({ body }) => {
+      const { distillConversation } = require('../../gep/conversationDistiller');
+      const input = body || {};
+      const distill = distillConversation(input, { persist: input.persist !== false });
+      if (!distill.ok) return { body: distill };
+
+      let publishResult = null;
+      if (input.publish !== false) {
+        publishResult = await proxyHandlers.assetPublish({
+          assets: [distill.gene, distill.capsule].filter(Boolean),
+        });
+      }
+
+      return {
+        body: {
+          ...distill,
+          queued: false,
+          published: Boolean(publishResult),
+          publish_result: publishResult,
+        },
+      };
+    },
+
     'GET /asset/submissions': async ({ query }) => {
       const submissions = store.list({
         type: 'asset_submit',
@@ -378,6 +401,10 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
       const inPending = store.countPending({ direction: 'inbound' });
       const nodeId = store.getState('node_id');
       const lastSync = store.getState('last_sync_at');
+      const lastSyncError = store.getState('last_sync_error');
+      const hubAuthStatus = store.getState('hub_auth_status');
+      const reauthBackoffUntil = store.getState('reauth_backoff_until');
+      const helloRateLimitUntil = store.getState('hello_rate_limit_until');
       return {
         body: {
           status: 'running',
@@ -387,6 +414,10 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
           outbound_pending: outPending,
           inbound_pending: inPending,
           last_sync_at: lastSync,
+          last_sync_error: lastSyncError || null,
+          hub_auth_status: hubAuthStatus || null,
+          reauth_backoff_until: reauthBackoffUntil || null,
+          hello_rate_limit_until: helloRateLimitUntil || null,
         },
       };
     },

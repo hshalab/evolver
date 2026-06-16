@@ -16,6 +16,16 @@ function startStub(handler) {
   });
 }
 
+// Header-phase abort budget for the "does not abort an SSE stream" test. It must
+// comfortably exceed real header-arrival latency to the localhost stub — measured
+// at ~76ms on a cold first request (undici/JIT/socket warm-up) and up to ~90ms
+// under GC/scheduler pressure — so the header race is never lost. A `before`-hook
+// warm-up pays the cold-start once; this budget then only has to absorb jitter.
+const SLOW_STREAM_TIMEOUT_MS = 150;
+// The slow stub's body must finish AFTER the header timeout so the test keeps its
+// teeth: an uncleared header-phase timer would abort the body before it arrives.
+const SLOW_STREAM_BODY_DELAY_MS = 300;
+
 describe('EvoMapProxy._proxyOpenAIResponses', () => {
   let stub, proxy, captured;
   let savedOpenAIKey, savedEvomapOpenAIKey, savedOpenAIBaseUrl;
@@ -46,11 +56,14 @@ describe('EvoMapProxy._proxyOpenAIResponses', () => {
         if (req.url === '/v1/responses-slow-stream') {
           res.writeHead(200, { 'content-type': 'text/event-stream' });
           res.write('data: {"type":"response.created"}\n\n');
+          // Body completes well after SLOW_STREAM_TIMEOUT_MS so the test still has
+          // teeth: if the proxy failed to clear its header-phase abort timer once
+          // the stream began, that timer would fire here and abort the body read.
           setTimeout(() => {
             res.write('data: {"type":"response.completed"}\n\n');
             res.write('data: [DONE]\n\n');
             res.end();
-          }, 80);
+          }, SLOW_STREAM_BODY_DELAY_MS);
           return;
         }
         if (req.url === '/v1/responses-timeout') {
@@ -74,6 +87,22 @@ describe('EvoMapProxy._proxyOpenAIResponses', () => {
       openaiBaseUrl: stub.baseUrl,
       logger: { log: () => {}, warn: () => {}, error: () => {} },
     });
+
+    // Warm up the streaming path (undici lazy init, JIT, keep-alive socket) once,
+    // outside any timed assertion. Without this the first *real* streaming request
+    // pays ~76ms of cold-start; under the tight header-phase timeout that made the
+    // "does not abort an SSE stream" subtest fail deterministically when run in
+    // isolation (it was the first such request) and flake intermittently in the
+    // full file. Doing it here makes every subtest independent of run order.
+    process.env.OPENAI_API_KEY = 'sk-warmup';
+    try {
+      const warm = await proxy._proxyOpenAIResponses('/responses-stream', { model: 'warmup', stream: true }, {
+        inboundHeaders: {},
+      });
+      for await (const _chunk of warm.stream) { /* drain */ }
+    } finally {
+      delete process.env.OPENAI_API_KEY;
+    }
   });
 
   after(async () => {
@@ -171,7 +200,7 @@ describe('EvoMapProxy._proxyOpenAIResponses', () => {
     process.env.OPENAI_API_KEY = 'sk-upstream';
     const res = await proxy._proxyOpenAIResponses('/responses-slow-stream', { model: 'gpt-5.5', stream: true }, {
       inboundHeaders: {},
-      timeoutMs: 20,
+      timeoutMs: SLOW_STREAM_TIMEOUT_MS,
     });
 
     let collected = '';

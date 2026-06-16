@@ -192,6 +192,63 @@ describe('ProxyHttpServer', () => {
     });
   });
 
+  describe('POST /conversation/distill', () => {
+    const validConversation = {
+      summary: 'Reusable Evolver distill endpoint compatibility workflow for MCP plugin bridges.',
+      assistant_summary: 'Added a Proxy conversation distillation bridge so Codex, Claude Code, Cursor, WorkBuddy, and Antigravity plugins can publish Genes and Capsules without hitting a 404.',
+      strategy: [
+        'Verify each plugin bridge calls the same Proxy route before changing repository code.',
+        'Keep the Proxy route on the current signed asset publish path instead of the old mailbox submit path.',
+        'Add focused tests for draft distillation, publish forwarding, and low quality skipped inputs.',
+      ],
+      artifacts: ['src/proxy/server/routes.js', 'src/gep/conversationDistiller.js'],
+      validation: ['node --test test/proxyServer.test.js'],
+      signals: ['distill_endpoint', 'proxy_compatibility', 'test_verified'],
+    };
+
+    it('distills a high-confidence conversation as a draft when publish and persist are disabled', async () => {
+      const res = await authedReq(`${baseUrl}/conversation/distill`, 'POST', {
+        ...validConversation,
+        persist: false,
+        publish: false,
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.status, 'draft');
+      assert.equal(res.body.published, false);
+      assert.equal(res.body.publish_result, null);
+      assert.equal(res.body.gene.type, 'Gene');
+      assert.equal(res.body.capsule.type, 'Capsule');
+      assert.deepEqual(res.body.capsule.blast_radius, { files: 1, lines: 1 });
+      assert.equal(typeof res.body.capsule.content, 'string');
+      assert.equal(typeof res.body.capsule.diff, 'string');
+      assert.equal(typeof res.body.capsule.reused_asset_id, 'string');
+      assert.equal(typeof res.body.capsule.env_fingerprint, 'object');
+    });
+
+    it('publishes distilled Gene and Capsule through the current asset publish handler', async () => {
+      const res = await authedReq(`${baseUrl}/conversation/distill`, 'POST', {
+        ...validConversation,
+        persist: false,
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.published, true);
+      assert.equal(res.body.publish_result.published, 2);
+      assert.equal(res.body.publish_result.total, 2);
+    });
+
+    it('skips low-signal conversations instead of publishing noise', async () => {
+      const res = await authedReq(`${baseUrl}/conversation/distill`, 'POST', {
+        summary: 'too short',
+        publish: false,
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, false);
+      assert.equal(res.body.status, 'skipped');
+    });
+  });
+
   describe('POST /asset/validate', () => {
     it('validates asset via proxy', async () => {
       const res = await authedReq(`${baseUrl}/asset/validate`, 'POST', {
@@ -327,6 +384,20 @@ describe('ProxyHttpServer', () => {
       assert.ok(res.body.proxy_protocol_version, 'should include proxy_protocol_version');
       assert.ok(res.body.schema_version, 'should include schema_version');
       assert.match(res.body.proxy_protocol_version, /^\d+\.\d+\.\d+$/);
+    });
+
+    it('surfaces sync and auth diagnostics for local bridge clients', async () => {
+      store.setState('last_sync_error', 'hub_401');
+      store.setState('hub_auth_status', 'unauthorized');
+      store.setState('reauth_backoff_until', '2026-06-15T12:00:00.000Z');
+      store.setState('hello_rate_limit_until', '2026-06-15T12:01:00.000Z');
+
+      const res = await authedReq(`${baseUrl}/proxy/status`, 'GET');
+      assert.equal(res.status, 200);
+      assert.equal(res.body.last_sync_error, 'hub_401');
+      assert.equal(res.body.hub_auth_status, 'unauthorized');
+      assert.equal(res.body.reauth_backoff_until, '2026-06-15T12:00:00.000Z');
+      assert.equal(res.body.hello_rate_limit_until, '2026-06-15T12:01:00.000Z');
     });
   });
 

@@ -31,6 +31,9 @@ require.cache[lifecyclePath] = {
 };
 
 const { SyncEngine } = require('../src/proxy/sync/engine');
+const { InboundSync } = require('../src/proxy/sync/inbound');
+const { OutboundSync } = require('../src/proxy/sync/outbound');
+const hubFetchMod = require('../src/gep/hubFetch');
 
 // Quiet logger so the deliberate error paths don't spam test output but the
 // asserts on what got logged remain straightforward.
@@ -51,6 +54,61 @@ function makeStore(overrides = {}) {
   return Object.assign({
     countPending: () => 1,
   }, overrides);
+}
+
+function makeMailboxStore(overrides = {}) {
+  const state = { node_id: 'node_aaaaaaaaaaaa' };
+  return Object.assign({
+    getState: (key) => (state[key] !== undefined ? state[key] : null),
+    setState: (key, value) => { state[key] = value; },
+    getCursor: () => null,
+    setCursor: () => {},
+    writeInboundBatch: () => {},
+    writeInbound: () => {},
+    list: () => [],
+    pollOutbound: () => [],
+    countPending: () => 0,
+    incrementRetry: () => {},
+    updateStatusBatch: () => {},
+    _state: state,
+  }, overrides);
+}
+
+function makeTextResponse(status, contentType, body) {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers({ 'content-type': contentType }),
+    text: async () => body,
+  };
+}
+
+async function runOneScheduledTick(schedule) {
+  const realSetTimeout = global.setTimeout;
+  const delays = [];
+  let resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+  global.setTimeout = (fn, delay) => {
+    delays.push(delay);
+    const timer = { unref: () => {} };
+    if (delays.length === 1) {
+      realSetTimeout(async () => {
+        try {
+          await fn();
+        } finally {
+          resolveDone();
+        }
+      }, 0);
+    }
+    return timer;
+  };
+  try {
+    schedule();
+    await done;
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+  return delays;
 }
 
 async function waitFor(predicate, { timeoutMs = 2000, intervalMs = 25 } = {}) {
@@ -312,5 +370,190 @@ describe('SyncEngine stop() still wins over the resilience layer', () => {
     await new Promise((r) => setTimeout(r, 1000));
     assert.equal(flushStarted, startedAfterStop,
       'no further flushes after stop() — got ' + flushStarted + ' vs at-stop=' + startedAfterStop);
+  });
+});
+
+describe('SyncEngine Hub non-API response backoff', () => {
+  let engine;
+
+  afterEach(() => {
+    hubFetchMod._setFetchImplForTest(null);
+    if (engine) {
+      engine._running = false;
+      engine._outTimer = null;
+      engine._inTimer = null;
+      try { engine.stop(); } catch (_) {}
+    }
+    engine = null;
+  });
+
+  it('InboundSync treats HTML 403 as hub unreachable without throwing AuthError', async () => {
+    hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+      403,
+      'text/html',
+      '<!DOCTYPE html><title>Cloudflare</title><body>Forbidden</body>',
+    ));
+    const logger = makeQuietLogger();
+    const inbound = new InboundSync({
+      store: makeMailboxStore(),
+      hubUrl: 'https://hub.example',
+      getHeaders: () => ({}),
+      logger,
+    });
+
+    const result = await inbound.pull();
+
+    assert.equal(result.hubUnreachable, true);
+    assert.equal(result.error, 'hub_unreachable');
+    assert.ok(result.retryAfterMs >= 60_000);
+    assert.deepEqual(logger._errors, []);
+  });
+
+  it('OutboundSync does not increment retry counters for HTML 504 hub outages', async () => {
+    hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+      504,
+      'text/html',
+      '<!DOCTYPE html><title>Gateway timeout</title>',
+    ));
+    let retryIncrements = 0;
+    const outbound = new OutboundSync({
+      store: makeMailboxStore({
+        pollOutbound: () => [{
+          id: 'msg_1',
+          type: 'asset_submit',
+          payload: { ok: true },
+          priority: 'normal',
+          ref_id: null,
+          created_at: new Date().toISOString(),
+          retry_count: 0,
+        }],
+        incrementRetry: () => { retryIncrements++; },
+      }),
+      hubUrl: 'https://hub.example',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+
+    const result = await outbound.flush();
+
+    assert.equal(result.hubUnreachable, true);
+    assert.equal(result.error, 'hub_unreachable');
+    assert.ok(result.retryAfterMs >= 60_000);
+    assert.equal(retryIncrements, 0);
+  });
+
+  it('OutboundSync backs off on successful HTML non-API responses', async () => {
+    hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+      200,
+      'text/html; charset=utf-8',
+      '<!DOCTYPE html><title>Captive portal</title>',
+    ));
+    let retryIncrements = 0;
+    const outbound = new OutboundSync({
+      store: makeMailboxStore({
+        pollOutbound: () => [{
+          id: 'msg_1',
+          type: 'asset_submit',
+          payload: { ok: true },
+          priority: 'normal',
+          ref_id: null,
+          created_at: new Date().toISOString(),
+          retry_count: 0,
+        }],
+        incrementRetry: () => { retryIncrements++; },
+      }),
+      hubUrl: 'https://hub.example',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+
+    const result = await outbound.flush();
+
+    assert.equal(result.hubUnreachable, true);
+    assert.equal(result.error, 'hub_unreachable');
+    assert.ok(result.retryAfterMs >= 60_000);
+    assert.equal(retryIncrements, 0);
+  });
+
+  it('OutboundSync backs off on successful text/plain non-API responses', async () => {
+    hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+      200,
+      'text/plain; charset=utf-8',
+      'edge gateway maintenance page',
+    ));
+    let retryIncrements = 0;
+    const outbound = new OutboundSync({
+      store: makeMailboxStore({
+        pollOutbound: () => [{
+          id: 'msg_1',
+          type: 'asset_submit',
+          payload: { ok: true },
+          priority: 'normal',
+          ref_id: null,
+          created_at: new Date().toISOString(),
+          retry_count: 0,
+        }],
+        incrementRetry: () => { retryIncrements++; },
+      }),
+      hubUrl: 'https://hub.example',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+
+    const result = await outbound.flush();
+
+    assert.equal(result.hubUnreachable, true);
+    assert.equal(result.error, 'hub_unreachable');
+    assert.ok(result.retryAfterMs >= 60_000);
+    assert.equal(retryIncrements, 0);
+  });
+
+  it('inbound loop schedules returned hub retryAfterMs and skips ack', async () => {
+    let ackCalls = 0;
+    engine = new SyncEngine({
+      store: makeStore(),
+      hubUrl: 'https://hub.example/test',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+    engine.outbound = { flush: async () => ({ sent: 0 }) };
+    engine.inbound = {
+      pull: async () => ({ received: 0, hubUnreachable: true, retryAfterMs: 61_000 }),
+      ackDelivered: async () => {
+        ackCalls++;
+        return { acked: 0 };
+      },
+    };
+    engine._running = true;
+
+    const delays = await runOneScheduledTick(() => engine._scheduleInbound(0));
+
+    assert.equal(delays[0], 0);
+    assert.equal(delays[1], 61_000);
+    assert.equal(ackCalls, 0);
+  });
+
+  it('outbound loop schedules returned hub retryAfterMs without polling countPending', async () => {
+    let countPendingCalls = 0;
+    engine = new SyncEngine({
+      store: makeStore({
+        countPending: () => {
+          countPendingCalls++;
+          return 1;
+        },
+      }),
+      hubUrl: 'https://hub.example/test',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+    engine.outbound = { flush: async () => ({ sent: 0, hubUnreachable: true, retryAfterMs: 62_000 }) };
+    engine.inbound = { pull: async () => ({ received: 0 }), ackDelivered: async () => ({ acked: 0 }) };
+    engine._running = true;
+
+    const delays = await runOneScheduledTick(() => engine._scheduleOutbound(0));
+
+    assert.equal(delays[0], 0);
+    assert.equal(delays[1], 62_000);
+    assert.equal(countPendingCalls, 0);
   });
 });

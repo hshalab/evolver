@@ -47,15 +47,19 @@ function writeSettings(data) {
   return merged;
 }
 
-function clearSettings() {
+function clearSettings(opts = {}) {
   try {
     const file = getSettingsFile();
     if (fs.existsSync(file)) {
       const current = readSettings();
+      const proxyPid = current.proxy?.pid;
+      if (!opts.force && proxyPid && proxyPid !== process.pid) return false;
       delete current.proxy;
       fs.writeFileSync(file, JSON.stringify(current, null, 2), 'utf8');
+      return true;
     }
   } catch {}
+  return false;
 }
 
 function isStaleProxy() {
@@ -82,7 +86,7 @@ function isStaleProxy() {
 
 function clearIfStale() {
   if (isStaleProxy()) {
-    clearSettings();
+    clearSettings({ force: true });
     return true;
   }
   return false;

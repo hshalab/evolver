@@ -3,7 +3,14 @@
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { AuthError } = require('../lifecycle/manager');
 const { isProxyTraceUploadPayloadAllowed, resolveTraceMode } = require('../trace/extractor');
-const { hubFetch } = require('../../gep/hubFetch');
+const {
+  hubFetch,
+  hubUnreachableBackoffMs,
+  isHubUnreachableError,
+  readHubResponseJson,
+  readHubResponseText,
+  throwIfHubUnreachableResponse,
+} = require('../../gep/hubFetch');
 
 const MAX_BATCH = 50;
 const MAX_RETRIES = 10;
@@ -14,9 +21,41 @@ class OutboundSync {
     this.hubUrl = hubUrl;
     this.logger = logger || console;
     this.getHeaders = getHeaders;
+    this._hubUnreachableFailures = 0;
+    this._hubUnreachableUntil = 0;
+  }
+
+  _hubUnreachableWaitMs() {
+    return Math.max(0, this._hubUnreachableUntil - Date.now());
+  }
+
+  _recordHubReachable() {
+    this._hubUnreachableFailures = 0;
+    this._hubUnreachableUntil = 0;
+  }
+
+  _recordHubUnreachable(err) {
+    this._hubUnreachableFailures += 1;
+    const retryAfterMs = hubUnreachableBackoffMs(this._hubUnreachableFailures);
+    this._hubUnreachableUntil = Date.now() + retryAfterMs;
+    this.logger.warn?.(
+      `[outbound] Hub unreachable; backing off for ${Math.ceil(retryAfterMs / 1000)}s: ` +
+        `${err && err.message || err}`
+    );
+    return retryAfterMs;
   }
 
   async flush(channel = 'evomap-hub') {
+    const waitMs = this._hubUnreachableWaitMs();
+    if (waitMs > 0) {
+      return {
+        sent: 0,
+        error: 'hub_unreachable_backoff',
+        hubUnreachable: true,
+        retryAfterMs: waitMs,
+      };
+    }
+
     const pendingBatch = this.store.pollOutbound({ channel, limit: MAX_BATCH });
     if (pendingBatch.length === 0) return { sent: 0 };
 
@@ -65,17 +104,20 @@ class OutboundSync {
         signal: AbortSignal.timeout(30_000),
       });
 
+      await throwIfHubUnreachableResponse(res, 'outbound flush');
+      this._recordHubReachable();
+
       if (res.status === 403 || res.status === 401) {
-        const errText = await res.text().catch(() => 'unknown');
+        const errText = await readHubResponseText(res).catch(() => 'unknown');
         throw new AuthError(`Hub ${res.status}: ${errText}`, res.status);
       }
 
       if (!res.ok) {
-        const errText = await res.text().catch(() => 'unknown');
+        const errText = await readHubResponseText(res).catch(() => 'unknown');
         throw new Error(`Hub returned ${res.status}: ${errText}`);
       }
 
-      const data = await res.json();
+      const data = await readHubResponseJson(res);
       const results = data.results || [];
 
       const updates = [];
@@ -112,6 +154,17 @@ class OutboundSync {
       return result;
     } catch (err) {
       if (err instanceof AuthError) throw err;
+      if (isHubUnreachableError(err)) {
+        const retryAfterMs = this._recordHubUnreachable(err);
+        const result = {
+          sent: 0,
+          error: 'hub_unreachable',
+          hubUnreachable: true,
+          retryAfterMs,
+        };
+        if (dropped > 0) result.dropped = dropped;
+        return result;
+      }
       this.logger.error(`[outbound] flush failed: ${err.message}`);
       for (const m of pending) {
         this.store.incrementRetry(m.id, err.message);

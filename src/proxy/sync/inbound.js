@@ -2,7 +2,15 @@
 
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { AuthError } = require('../lifecycle/manager');
-const { hubFetch } = require('../../gep/hubFetch');
+const {
+  drainHubResponse,
+  hubFetch,
+  hubUnreachableBackoffMs,
+  isHubUnreachableError,
+  readHubResponseJson,
+  readHubResponseText,
+  throwIfHubUnreachableResponse,
+} = require('../../gep/hubFetch');
 
 const DEFAULT_POLL_INTERVAL_ACTIVE = 10_000;
 const DEFAULT_POLL_INTERVAL_IDLE = 60_000;
@@ -13,9 +21,41 @@ class InboundSync {
     this.hubUrl = hubUrl;
     this.logger = logger || console;
     this.getHeaders = getHeaders;
+    this._hubUnreachableFailures = 0;
+    this._hubUnreachableUntil = 0;
+  }
+
+  _hubUnreachableWaitMs() {
+    return Math.max(0, this._hubUnreachableUntil - Date.now());
+  }
+
+  _recordHubReachable() {
+    this._hubUnreachableFailures = 0;
+    this._hubUnreachableUntil = 0;
+  }
+
+  _recordHubUnreachable(err) {
+    this._hubUnreachableFailures += 1;
+    const retryAfterMs = hubUnreachableBackoffMs(this._hubUnreachableFailures);
+    this._hubUnreachableUntil = Date.now() + retryAfterMs;
+    this.logger.warn?.(
+      `[inbound] Hub unreachable; backing off for ${Math.ceil(retryAfterMs / 1000)}s: ` +
+        `${err && err.message || err}`
+    );
+    return retryAfterMs;
   }
 
   async pull(channel = 'evomap-hub', limit = 50) {
+    const waitMs = this._hubUnreachableWaitMs();
+    if (waitMs > 0) {
+      return {
+        received: 0,
+        error: 'hub_unreachable_backoff',
+        hubUnreachable: true,
+        retryAfterMs: waitMs,
+      };
+    }
+
     const cursorKey = `${channel}:inbound_cursor`;
     const cursor = this.store.getCursor(cursorKey);
 
@@ -30,17 +70,20 @@ class InboundSync {
         signal: AbortSignal.timeout(35_000),
       });
 
+      await throwIfHubUnreachableResponse(res, 'inbound pull');
+      this._recordHubReachable();
+
       if (res.status === 403 || res.status === 401) {
-        const errText = await res.text().catch(() => 'unknown');
+        const errText = await readHubResponseText(res).catch(() => 'unknown');
         throw new AuthError(`Hub ${res.status}: ${errText}`, res.status);
       }
 
       if (!res.ok) {
-        const errText = await res.text().catch(() => 'unknown');
+        const errText = await readHubResponseText(res).catch(() => 'unknown');
         throw new Error(`Hub returned ${res.status}: ${errText}`);
       }
 
-      const data = await res.json();
+      const data = await readHubResponseJson(res);
       const messages = data.messages || [];
 
       if (messages.length > 0) {
@@ -64,12 +107,31 @@ class InboundSync {
       return { received: messages.length, cursor: data.next_cursor || cursor };
     } catch (err) {
       if (err instanceof AuthError) throw err;
+      if (isHubUnreachableError(err)) {
+        const retryAfterMs = this._recordHubUnreachable(err);
+        return {
+          received: 0,
+          error: 'hub_unreachable',
+          hubUnreachable: true,
+          retryAfterMs,
+        };
+      }
       this.logger.error(`[inbound] pull failed: ${err.message}`);
       return { received: 0, error: err.message };
     }
   }
 
   async ackDelivered(channel = 'evomap-hub') {
+    const waitMs = this._hubUnreachableWaitMs();
+    if (waitMs > 0) {
+      return {
+        acked: 0,
+        error: 'hub_unreachable_backoff',
+        hubUnreachable: true,
+        retryAfterMs: waitMs,
+      };
+    }
+
     const delivered = this.store.list({
       type: '%',
       direction: 'inbound',
@@ -97,13 +159,29 @@ class InboundSync {
         body: JSON.stringify({ sender_id: senderId, message_ids: delivered.map(m => m.id) }),
         signal: AbortSignal.timeout(10_000),
       });
-      try {
-        if (res && res.body && typeof res.body.cancel === 'function') {
-          await res.body.cancel().catch(() => {});
-        }
-      } catch (_) { /* never escape the drain helper */ }
+      await throwIfHubUnreachableResponse(res, 'inbound ack');
+      this._recordHubReachable();
+      if (res.status === 403 || res.status === 401) {
+        const errText = await readHubResponseText(res).catch(() => 'unknown');
+        throw new AuthError(`Hub ${res.status}: ${errText}`, res.status);
+      }
+      if (!res.ok) {
+        const errText = await readHubResponseText(res).catch(() => 'unknown');
+        throw new Error(`Hub returned ${res.status}: ${errText}`);
+      }
+      await drainHubResponse(res);
       return { acked: delivered.length };
     } catch (err) {
+      if (err instanceof AuthError) throw err;
+      if (isHubUnreachableError(err)) {
+        const retryAfterMs = this._recordHubUnreachable(err);
+        return {
+          acked: 0,
+          error: 'hub_unreachable',
+          hubUnreachable: true,
+          retryAfterMs,
+        };
+      }
       this.logger.error(`[inbound] ack failed: ${err.message}`);
       return { acked: 0, error: err.message };
     }

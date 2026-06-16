@@ -77,12 +77,14 @@ class SyncEngine {
       // the whole tick, schedule the next iteration in `finally` so a
       // surprise throw cannot park the loop.
       let nextDelay = DEFAULT_OUTBOUND_INTERVAL;
+      let hubRetryAfterMs = 0;
       try {
         if (!this._running) return;
         this._outPending = true;
         try {
           const result = await this.outbound.flush();
           if (result.sent > 0) this._lastActivity = Date.now();
+          if (result.retryAfterMs > 0) hubRetryAfterMs = result.retryAfterMs;
           if ((result.sent > 0 || result.dropped > 0) && typeof this.onOutboundFlushed === 'function') {
             try { this.onOutboundFlushed(result); } catch (e) {
               this.logger.warn?.('[sync] onOutboundFlushed callback failed:', e.message);
@@ -96,13 +98,17 @@ class SyncEngine {
           }
         }
         this._outPending = false;
-        try {
-          const pending = this.store.countPending({ direction: 'outbound' });
-          if (pending > 0) nextDelay = 1_000;
-        } catch (err) {
-          // countPending threw (corrupt store, FS hiccup): keep the
-          // default cadence rather than parking the loop.
-          this.logger.error(`[sync] countPending threw (non-fatal): ${err && err.message}`);
+        if (hubRetryAfterMs > 0) {
+          nextDelay = Math.max(1_000, hubRetryAfterMs);
+        } else {
+          try {
+            const pending = this.store.countPending({ direction: 'outbound' });
+            if (pending > 0) nextDelay = 1_000;
+          } catch (err) {
+            // countPending threw (corrupt store, FS hiccup): keep the
+            // default cadence rather than parking the loop.
+            this.logger.error(`[sync] countPending threw (non-fatal): ${err && err.message}`);
+          }
         }
       } catch (err) {
         // Anything that escaped the inner blocks above. Log and let
@@ -123,11 +129,14 @@ class SyncEngine {
       // from inbound.pull / ackDelivered / _isIdle used to escape the
       // setTimeout callback and silently park the inbound loop.
       let nextDelay = DEFAULT_POLL_INTERVAL_ACTIVE;
+      let hubRetryAfterMs = 0;
       try {
         if (!this._running) return;
         try {
           const result = await this.inbound.pull();
-          if (result.received > 0) {
+          if (result.retryAfterMs > 0) {
+            hubRetryAfterMs = result.retryAfterMs;
+          } else if (result.received > 0) {
             this._lastActivity = Date.now();
             if (typeof this.onInboundReceived === 'function') {
               try { this.onInboundReceived(result.received); } catch (e) {
@@ -135,7 +144,10 @@ class SyncEngine {
               }
             }
           }
-          await this.inbound.ackDelivered();
+          if (!hubRetryAfterMs) {
+            const ack = await this.inbound.ackDelivered();
+            if (ack.retryAfterMs > 0) hubRetryAfterMs = ack.retryAfterMs;
+          }
         } catch (err) {
           if (err instanceof AuthError) {
             await this._handleAuthError('inbound');
@@ -143,12 +155,16 @@ class SyncEngine {
             this.logger.error(`[sync] inbound error: ${err.message}`);
           }
         }
-        try {
-          nextDelay = this._isIdle()
-            ? DEFAULT_POLL_INTERVAL_IDLE
-            : DEFAULT_POLL_INTERVAL_ACTIVE;
-        } catch (err) {
-          this.logger.error(`[sync] _isIdle threw (non-fatal): ${err && err.message}`);
+        if (hubRetryAfterMs > 0) {
+          nextDelay = Math.max(1_000, hubRetryAfterMs);
+        } else {
+          try {
+            nextDelay = this._isIdle()
+              ? DEFAULT_POLL_INTERVAL_IDLE
+              : DEFAULT_POLL_INTERVAL_ACTIVE;
+          } catch (err) {
+            this.logger.error(`[sync] _isIdle threw (non-fatal): ${err && err.message}`);
+          }
         }
       } catch (err) {
         this.logger.error(`[sync] inbound tick threw (non-fatal): ${err && err.message}`);

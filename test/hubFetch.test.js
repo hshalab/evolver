@@ -198,6 +198,183 @@ describe('hubFetch — unit', () => {
     const { hubFetch } = hubFetchMod;
     await assert.rejects(() => hubFetch('http://hub.example.com', {}), /https:\/\//);
   });
+
+  it('classifies non-JSON Hub 403 responses as hub unreachable, not auth', async () => {
+    const { throwIfHubUnreachableResponse } = hubFetchMod;
+    let textCalls = 0;
+    const res = {
+      status: 403,
+      ok: false,
+      headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+      text: async () => {
+        textCalls++;
+        return '<!DOCTYPE html><title>Cloudflare</title><body>Forbidden</body>';
+      },
+    };
+
+    await assert.rejects(
+      () => throwIfHubUnreachableResponse(res, 'heartbeat'),
+      (err) => {
+        assert.equal(err.name, 'HubUnreachableError');
+        assert.equal(err.code, 'HUB_UNREACHABLE');
+        assert.equal(err.statusCode, 403);
+        assert.match(err.bodySnippet, /Cloudflare/);
+        return true;
+      },
+    );
+    assert.equal(textCalls, 1);
+  });
+
+  it('classifies successful HTML Hub responses as hub unreachable', async () => {
+    const { throwIfHubUnreachableResponse } = hubFetchMod;
+    let textCalls = 0;
+    const res = {
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+      text: async () => {
+        textCalls++;
+        return '<!DOCTYPE html><title>Captive portal</title><body>Sign in</body>';
+      },
+    };
+
+    await assert.rejects(
+      () => throwIfHubUnreachableResponse(res, 'mailbox outbound'),
+      (err) => {
+        assert.equal(err.name, 'HubUnreachableError');
+        assert.equal(err.code, 'HUB_UNREACHABLE');
+        assert.equal(err.statusCode, 200);
+        assert.match(err.bodySnippet, /Captive portal/);
+        return true;
+      },
+    );
+    assert.equal(textCalls, 1);
+  });
+
+  it('classifies successful non-JSON non-HTML Hub responses as hub unreachable', async () => {
+    const { throwIfHubUnreachableResponse } = hubFetchMod;
+    const statuses = [200, 201, 204, 299];
+
+    for (const status of statuses) {
+      let textCalls = 0;
+      const res = {
+        status,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/plain; charset=utf-8' }),
+        text: async () => {
+          textCalls++;
+          return 'temporary proxy maintenance page';
+        },
+      };
+
+      await assert.rejects(
+        () => throwIfHubUnreachableResponse(res, 'mailbox outbound'),
+        (err) => {
+          assert.equal(err.name, 'HubUnreachableError');
+          assert.equal(err.code, 'HUB_UNREACHABLE');
+          assert.equal(err.statusCode, status);
+          assert.match(err.bodySnippet, /temporary proxy maintenance/);
+          return true;
+        },
+      );
+      assert.equal(textCalls, 1, `status ${status} body should be consumed once`);
+    }
+  });
+
+  it('does not classify JSON auth or JSON server errors as hub unreachable', async () => {
+    const { throwIfHubUnreachableResponse } = hubFetchMod;
+    for (const status of [403, 500, 503]) {
+      let textCalls = 0;
+      const res = {
+        status,
+        ok: false,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        text: async () => {
+          textCalls++;
+          return '{"error":"hub_api_error"}';
+        },
+      };
+      await assert.doesNotReject(() => throwIfHubUnreachableResponse(res, 'json api'));
+      assert.equal(textCalls, 0, `JSON status ${status} should not consume the body`);
+    }
+  });
+
+  it('readHubResponseText truncates and cancels long response streams', async () => {
+    const { readHubResponseText } = hubFetchMod;
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('x'.repeat(64)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const text = await readHubResponseText({ body: stream }, { maxBytes: 8 });
+    assert.equal(text, 'xxxxxxxx\n...[truncated]');
+    assert.equal(cancelled, true);
+  });
+
+  it('readHubResponseText does NOT truncate a stream that exactly fills maxBytes', async () => {
+    const { readHubResponseText } = hubFetchMod;
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('x'.repeat(8)));
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const text = await readHubResponseText({ body: stream }, { maxBytes: 8 });
+    assert.equal(text, 'xxxxxxxx', 'a body equal to the cap is complete, not truncated');
+    assert.equal(cancelled, false, 'a cleanly-ended stream must not be cancelled');
+  });
+
+  it('readHubResponseJson parses a JSON body sitting exactly on the byte cap', async () => {
+    const { readHubResponseJson } = hubFetchMod;
+    const json = '{"ok":true}';
+    const bytes = Buffer.byteLength(json, 'utf8');
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(json));
+        controller.close();
+      },
+    });
+
+    const data = await readHubResponseJson({ body: stream }, { maxBytes: bytes });
+    assert.deepEqual(data, { ok: true });
+  });
+
+  it('readHubResponseJson rejects empty response bodies as invalid JSON', async () => {
+    const { readHubResponseJson } = hubFetchMod;
+    let textCalls = 0;
+    const res = {
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: async () => {
+        textCalls++;
+        return '';
+      },
+    };
+
+    await assert.rejects(
+      () => readHubResponseJson(res),
+      (err) => {
+        assert.equal(err instanceof SyntaxError, true);
+        assert.match(err.message, /Unexpected end of JSON input/);
+        return true;
+      },
+    );
+    assert.equal(textCalls, 1);
+  });
 });
 
 // --- integration: real HTTPS server with a self-signed cert ---

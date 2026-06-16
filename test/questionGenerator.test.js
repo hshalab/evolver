@@ -25,10 +25,48 @@ describe('questionGenerator', () => {
   });
 
   describe('generateQuestions (standard path)', () => {
-    it('returns empty when no triggering signals', () => {
+    it('returns empty when no triggering signals and no work to anchor on', () => {
       const qs = generateQuestions({ signals: ['stable_success_plateau'], recentEvents: [] });
       assert.ok(Array.isArray(qs));
       assert.strictEqual(qs.length, 0);
+    });
+
+    it('generates an exploration question for a healthy agent with recent work', () => {
+      const qs = generateQuestions({
+        signals: ['stable_success_plateau'],
+        recentEvents: [{ genes_used: ['gene_pdf_extract'] }],
+        sessionTranscript: 'invoice pdf extraction pipeline. invoice table parser. invoice pipeline throughput.',
+        memorySnippet: 'agent specializes in invoice pdf pipeline',
+      });
+      assert.strictEqual(qs.length, 1, 'healthy agent with work should ask one exploration question');
+      assert.ok(qs[0].signals.includes('exploration'), 'should be tagged exploration');
+      assert.ok(/invoice|pipeline|pdf/.test(qs[0].question), 'should anchor on real recent work');
+    });
+
+    it('problem questions outrank exploration and exploration does not crowd them out', () => {
+      const qs = generateQuestions({
+        signals: ['recurring_error', 'recurring_errsig(3x): TypeError cannot read property'],
+        recentEvents: [{ genes_used: ['gene_x'] }],
+        sessionTranscript: 'parser parser parser handling something parser',
+      });
+      assert.ok(qs.length >= 1);
+      assert.ok(qs[0].question.includes('Recurring error'), 'highest-priority problem question wins the top slot');
+    });
+
+    it('honors EVOLVER_EXPLORATION_QUESTIONS=0 kill switch', () => {
+      const prev = process.env.EVOLVER_EXPLORATION_QUESTIONS;
+      process.env.EVOLVER_EXPLORATION_QUESTIONS = '0';
+      try {
+        const qs = generateQuestions({
+          signals: ['stable_success_plateau'],
+          recentEvents: [{ genes_used: ['gene_x'] }],
+          sessionTranscript: 'invoice pdf pipeline invoice pipeline',
+        });
+        assert.strictEqual(qs.length, 0, 'exploration disabled → no question for a healthy agent');
+      } finally {
+        if (prev === undefined) delete process.env.EVOLVER_EXPLORATION_QUESTIONS;
+        else process.env.EVOLVER_EXPLORATION_QUESTIONS = prev;
+      }
     });
 
     it('generates question on recurring_error signal', () => {

@@ -10,6 +10,8 @@ const path = require('path');
 const {
   readSettings,
   writeSettings,
+  clearSettings,
+  clearIfStale,
   getSettingsFile,
   getSettingsDir,
 } = require('../src/proxy/server/settings');
@@ -87,6 +89,61 @@ describe('settings', () => {
       env: { ...process.env, EVOLVER_SETTINGS_DIR: tmpDir },
     });
     assert.equal(out, 'proxy-token-test\n');
+  });
+
+  it('clearSettings removes the proxy block owned by the current process', () => {
+    writeSettings({
+      proxy: { url: 'http://127.0.0.1:19820', token: 'owned-token', pid: process.pid },
+      other: true,
+    });
+
+    const removed = clearSettings();
+
+    const settings = readSettings();
+    assert.equal(removed, true);
+    assert.equal(settings.proxy, undefined);
+    assert.equal(settings.other, true);
+  });
+
+  it('clearSettings preserves a proxy block owned by another process', () => {
+    writeSettings({
+      proxy: { url: 'http://127.0.0.1:19821', token: 'new-token', pid: process.pid + 1 },
+      other: true,
+    });
+
+    const removed = clearSettings();
+
+    const settings = readSettings();
+    assert.equal(removed, false);
+    assert.equal(settings.proxy.url, 'http://127.0.0.1:19821');
+    assert.equal(settings.proxy.token, 'new-token');
+    assert.equal(settings.other, true);
+  });
+
+  it('clearIfStale can still clear a stale proxy block', () => {
+    const realKill = process.kill;
+    process.kill = (pid, signal) => {
+      assert.equal(pid, 42424242);
+      assert.equal(signal, 0);
+      const err = new Error('not found');
+      err.code = 'ESRCH';
+      throw err;
+    };
+
+    try {
+      writeSettings({
+        proxy: { url: 'http://127.0.0.1:19822', token: 'stale-token', pid: 42424242 },
+        other: true,
+      });
+
+      const removed = clearIfStale();
+      const settings = readSettings();
+      assert.equal(removed, true);
+      assert.equal(settings.proxy, undefined);
+      assert.equal(settings.other, true);
+    } finally {
+      process.kill = realKill;
+    }
   });
 
   it('proxy-token command can read an explicit settings file', () => {

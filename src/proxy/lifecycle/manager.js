@@ -5,7 +5,14 @@ const path = require('path');
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { buildEnvelope } = require('../envelope');
 const crypto = require('crypto');
-const { hubFetch } = require('../../gep/hubFetch');
+const {
+  hubFetch,
+  hubUnreachableBackoffMs,
+  isHubUnreachableError,
+  readHubResponseJson,
+  readHubResponseText,
+  throwIfHubUnreachableResponse,
+} = require('../../gep/hubFetch');
 const { getEvomapPath } = require('../../gep/paths');
 // last_update transit (PR #188): proxy heartbeat ferries a pending
 // force_update outcome to the hub, then clears the state file on 2xx.
@@ -372,6 +379,8 @@ class LifecycleManager {
     this._consecutiveReauthFailures = 0;
     this._driftInterval = null;
     this._lastDriftCheckAt = 0;
+    this._hubUnreachableFailures = 0;
+    this._hubUnreachableUntil = 0;
 
     // H4 fix: persist the legacy node_id file as soon as the in-memory
     // node_id is known, NOT only after a successful hello(). The original
@@ -508,6 +517,26 @@ class LifecycleManager {
     return headers;
   }
 
+  _hubUnreachableWaitMs() {
+    return Math.max(0, this._hubUnreachableUntil - Date.now());
+  }
+
+  _recordHubReachable() {
+    this._hubUnreachableFailures = 0;
+    this._hubUnreachableUntil = 0;
+  }
+
+  _recordHubUnreachable(err) {
+    this._hubUnreachableFailures += 1;
+    const retryAfterMs = hubUnreachableBackoffMs(this._hubUnreachableFailures);
+    this._hubUnreachableUntil = Date.now() + retryAfterMs;
+    this.logger.warn?.(
+      `[lifecycle] Hub unreachable; backing off for ${Math.ceil(retryAfterMs / 1000)}s: ` +
+        `${err && err.message || err}`
+    );
+    return retryAfterMs;
+  }
+
   async hello({ rotateSecret = false } = {}) {
     if (!this.hubUrl) return { ok: false, error: 'no_hub_url' };
 
@@ -515,6 +544,15 @@ class LifecycleManager {
       const waitSec = Math.ceil((this._helloRateLimitUntil - Date.now()) / 1000);
       this.logger.warn(`[lifecycle] hello suppressed: rate limited for ${waitSec}s`);
       return { ok: false, error: 'hello_rate_limit_active', waitSec };
+    }
+
+    const waitMs = this._hubUnreachableWaitMs();
+    if (waitMs > 0) {
+      return {
+        ok: false,
+        error: 'hub_unreachable_backoff',
+        retryAfterMs: waitMs,
+      };
     }
 
     const endpoint = `${this.hubUrl}/a2a/hello`;
@@ -539,8 +577,10 @@ class LifecycleManager {
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(HELLO_TIMEOUT),
       });
+      await throwIfHubUnreachableResponse(res, 'lifecycle hello');
+      this._recordHubReachable();
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
+        const errData = await readHubResponseJson(res).catch(() => ({}));
         const errMsg = errData?.error || `http_${res.status}`;
         if (res.status === 429) {
           const retryAfter = parseInt(res.headers.get('retry-after') || '3600', 10);
@@ -552,7 +592,7 @@ class LifecycleManager {
         return { ok: false, error: errMsg, statusCode: res.status };
       }
 
-      const data = await res.json();
+      const data = await readHubResponseJson(res);
 
       if (data?.payload?.status === 'rejected') {
         this.logger.error(`[lifecycle] hello rejected: ${data.payload.reason || 'unknown'}`);
@@ -604,6 +644,15 @@ class LifecycleManager {
       this.logger.log(`[lifecycle] hello OK, node_id=${nodeId}${rotateSecret ? ' (secret rotated)' : ''}`);
       return { ok: true, nodeId, response: data };
     } catch (err) {
+      if (isHubUnreachableError(err)) {
+        const retryAfterMs = this._recordHubUnreachable(err);
+        return {
+          ok: false,
+          error: 'hub_unreachable',
+          detail: err.message,
+          retryAfterMs,
+        };
+      }
       this.logger.error(`[lifecycle] hello failed: ${err.message}`);
       return { ok: false, error: err.message };
     }
@@ -630,6 +679,7 @@ class LifecycleManager {
     }
     this._reauthInProgress = true;
     let manualResetRequired = false;
+    let hubUnreachable = false;
     try {
       for (let attempt = 1; attempt <= MAX_REAUTH_ATTEMPTS; attempt++) {
         this.logger.warn(`[lifecycle] re-auth attempt ${attempt}/${MAX_REAUTH_ATTEMPTS}: rotating secret via hello...`);
@@ -637,6 +687,17 @@ class LifecycleManager {
         if (!helloResult.ok) {
           this.logger.error(`[lifecycle] re-auth hello failed: ${helloResult.error}`);
           if (helloResult.error === 'hello_rate_limited' || helloResult.error === 'hello_rate_limit_active') break;
+          // Hub link is down (WAF HTML, network error, timeout) -- NOT an auth
+          // failure. Bail without arming the re-auth backoff: otherwise a
+          // transient outage that arrives mid-rotate would burn both attempts
+          // (attempt 2's hello short-circuits on the hub-unreachable window)
+          // and suppress genuine auth recovery for up to REAUTH_BACKOFF_MAX_MS,
+          // even though a JSON 401/403 retry would succeed once the hub is
+          // reachable again. The hub-unreachable window already gates re-entry.
+          if (helloResult.error === 'hub_unreachable' || helloResult.error === 'hub_unreachable_backoff') {
+            hubUnreachable = true;
+            break;
+          }
           if (typeof helloResult.error === 'string' && helloResult.error.startsWith('node_id_already_claimed')) {
             // Hub does not believe we own this nodeId. Our locally cached
             // secret(s) are useless. Drop them so attempt 2 retries WITHOUT
@@ -667,7 +728,18 @@ class LifecycleManager {
           // fire a second time anyway. Resetting the flag was misleading.
           return true;
         }
+        // Same as the hello path: if the verification heartbeat fails because
+        // the hub link dropped (not an auth rejection), defer without arming
+        // the re-auth backoff.
+        if (hbResult.error === 'hub_unreachable' || hbResult.error === 'hub_unreachable_backoff') {
+          hubUnreachable = true;
+          break;
+        }
         this.logger.warn(`[lifecycle] re-auth attempt ${attempt}: heartbeat still failing after rotate`);
+      }
+      if (hubUnreachable) {
+        this.logger.warn('[lifecycle] re-auth deferred: hub unreachable (no re-auth backoff armed)');
+        return false;
       }
       if (manualResetRequired) {
         this._emitManualResetNeeded();
@@ -734,6 +806,15 @@ class LifecycleManager {
     // unchanged; only the boundary moved earlier.
     if (!this.hubUrl) return { ok: false, error: 'no_hub_url' };
     try {
+      const waitMs = this._hubUnreachableWaitMs();
+      if (waitMs > 0) {
+        return {
+          ok: false,
+          error: 'hub_unreachable_backoff',
+          retryAfterMs: waitMs,
+        };
+      }
+
       const nodeId = this.nodeId;
       if (!nodeId) {
         const helloResult = await this.hello();
@@ -798,9 +879,12 @@ class LifecycleManager {
         signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT),
       });
 
+      await throwIfHubUnreachableResponse(res, 'lifecycle heartbeat');
+      this._recordHubReachable();
+
       if (res.status === 403 || res.status === 401) {
         this._consecutiveFailures++;
-        const errText = await res.text().catch(() => '');
+        const errText = await readHubResponseText(res).catch(() => '');
         this.logger.error(`[lifecycle] heartbeat auth failed (${res.status}): ${errText}`);
         if (!_skipReauth) {
           const recovered = await this.reAuthenticate();
@@ -813,7 +897,7 @@ class LifecycleManager {
       }
 
       if (!res.ok) {
-        const errText = await res.text().catch(() => '');
+        const errText = await readHubResponseText(res).catch(() => '');
         // 426 Upgrade Required: hub emits this when our evolver_version is
         // below the minimum version it requires. The body is JSON of shape
         // `{ error: 'evolver_min_version_required', force_update: {...} }`
@@ -881,7 +965,7 @@ class LifecycleManager {
         return { ok: false, error: `http_${res.status}`, statusCode: res.status };
       }
 
-      const data = await res.json();
+      const data = await readHubResponseJson(res);
 
       this._consecutiveFailures = 0;
       this.store.setState('last_heartbeat_at', new Date().toISOString());
@@ -981,6 +1065,16 @@ class LifecycleManager {
 
       return { ok: true, response: data };
     } catch (err) {
+      if (isHubUnreachableError(err)) {
+        this._consecutiveFailures++;
+        const retryAfterMs = this._recordHubUnreachable(err);
+        return {
+          ok: false,
+          error: 'hub_unreachable',
+          detail: err.message,
+          retryAfterMs,
+        };
+      }
       this._consecutiveFailures++;
       this.logger.error(`[lifecycle] heartbeat failed (${this._consecutiveFailures}): ${err.message}`);
       return { ok: false, error: err.message };
@@ -1074,7 +1168,14 @@ class LifecycleManager {
     // `DEFAULT_HEARTBEAT_INTERVAL` (6min) or the exponential branch
     // retries faster than the success branch (Bugbot #147 finding).
     const interval = this._heartbeatInterval || DEFAULT_HEARTBEAT_INTERVAL;
-    const backoff = this._consecutiveFailures > 0
+    const hubWaitMs = this._hubUnreachableWaitMs();
+    // While a hub-unreachable window is active, wake exactly when it elapses
+    // (1s floor to avoid a busy 0ms reschedule), mirroring SyncEngine's
+    // `Math.max(1_000, retryAfterMs)`. A 30s floor over-waited up to ~30s past
+    // the window's end, delaying recovery once the hub was reachable again.
+    const backoff = hubWaitMs > 0
+      ? Math.max(1_000, hubWaitMs)
+      : this._consecutiveFailures > 0
       ? Math.min(interval * Math.pow(2, this._consecutiveFailures), HEARTBEAT_BACKOFF_CAP_MS)
       : interval;
     const armedGen = this._heartbeatGen;

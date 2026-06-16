@@ -15,9 +15,13 @@ const test = require('node:test');
 const assert = require('node:assert');
 
 const { LifecycleManager, HEARTBEAT_BACKOFF_CAP_MS, DEFAULT_HEARTBEAT_INTERVAL } = require('../src/proxy/lifecycle/manager');
+const hubFetchMod = require('../src/gep/hubFetch');
 
 const _origInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
 process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
+test.afterEach(() => {
+  hubFetchMod._setFetchImplForTest(null);
+});
 test.after(() => {
   if (_origInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
   else process.env.EVOMAP_HUB_ALLOW_INSECURE = _origInsecure;
@@ -41,6 +45,15 @@ function makeStore({ nodeId = null, throwOnCountPending = false } = {}) {
     writeInboundBatch: (es) => inbound.push(...es),
     _inbound: inbound,
     _state: state,
+  };
+}
+
+function makeTextResponse(status, contentType, body) {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers({ 'content-type': contentType }),
+    text: async () => body,
   };
 }
 
@@ -128,6 +141,140 @@ test('heartbeat backoff caps at 15min and stays above DEFAULT_HEARTBEAT_INTERVAL
     if (mgr._heartbeatTimer) clearTimeout(mgr._heartbeatTimer);
   }
   assert.strictEqual(observedDelay, HEARTBEAT_BACKOFF_CAP_MS);
+});
+
+test('heartbeat treats HTML 403 as hub unreachable and does not re-authenticate', async () => {
+  hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+    403,
+    'text/html',
+    '<!DOCTYPE html><title>Cloudflare</title><body>Forbidden</body>',
+  ));
+  const mgr = new LifecycleManager({
+    hubUrl: 'http://hub.invalid',
+    store: makeStore({ nodeId: 'node_111111111111' }),
+    logger: silentLogger(),
+  });
+  let reauthCalls = 0;
+  mgr.reAuthenticate = async () => {
+    reauthCalls++;
+    return true;
+  };
+
+  const result = await mgr.heartbeat();
+
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.error, 'hub_unreachable');
+  assert.ok(result.retryAfterMs >= 60_000);
+  assert.strictEqual(reauthCalls, 0);
+  assert.strictEqual(mgr._consecutiveFailures, 1);
+});
+
+test('heartbeat still re-authenticates on JSON 403 from the Hub API', async () => {
+  hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+    403,
+    'application/json',
+    '{"error":"invalid_secret"}',
+  ));
+  const mgr = new LifecycleManager({
+    hubUrl: 'http://hub.invalid',
+    store: makeStore({ nodeId: 'node_222222222222' }),
+    logger: silentLogger(),
+  });
+  let reauthCalls = 0;
+  mgr.reAuthenticate = async () => {
+    reauthCalls++;
+    return false;
+  };
+
+  const result = await mgr.heartbeat();
+
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.error, 'auth_failed_403');
+  assert.strictEqual(reauthCalls, 1);
+  assert.strictEqual(mgr._consecutiveFailures, 1);
+});
+
+test('heartbeat treats 200 application/json with empty body as a failed heartbeat', async () => {
+  hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+    200,
+    'application/json',
+    '',
+  ));
+  const store = makeStore({ nodeId: 'node_444444444444' });
+  const mgr = new LifecycleManager({
+    hubUrl: 'http://hub.invalid',
+    store,
+    logger: silentLogger(),
+  });
+
+  const result = await mgr.heartbeat();
+
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /hub_unreachable|invalid_json|unexpected end|json/i);
+  assert.strictEqual(store.getState('last_heartbeat_at'), null);
+  assert.strictEqual(mgr._consecutiveFailures, 1);
+});
+
+test('heartbeat tick honors hub-unreachable retryAfter before generic failure backoff', async () => {
+  const mgr = new LifecycleManager({
+    hubUrl: 'http://hub.invalid',
+    store: makeStore({ nodeId: 'node_333333333333' }),
+    logger: silentLogger(),
+  });
+  mgr.heartbeat = async () => ({ ok: false, error: 'hub_unreachable_backoff', retryAfterMs: 61_000 });
+  mgr._hubUnreachableUntil = Date.now() + 61_000;
+  mgr._consecutiveFailures = 50;
+
+  const realSetTimeout = global.setTimeout;
+  let observedDelay = null;
+  global.setTimeout = (fn, delay) => {
+    observedDelay = delay;
+    return realSetTimeout(() => {}, 0);
+  };
+  try {
+    mgr._running = true;
+    mgr._heartbeatInterval = 360_000;
+    await mgr._heartbeatTick();
+  } finally {
+    global.setTimeout = realSetTimeout;
+    mgr._running = false;
+    if (mgr._heartbeatTimer) clearTimeout(mgr._heartbeatTimer);
+  }
+
+  assert.ok(observedDelay >= 60_000 && observedDelay <= 61_000,
+    `expected hub retryAfter-sized delay, got ${observedDelay}`);
+});
+
+test('heartbeat tick schedules the remaining hub window, not a 30s floor, when <30s left', async () => {
+  const mgr = new LifecycleManager({
+    hubUrl: 'http://hub.invalid',
+    store: makeStore({ nodeId: 'node_444444444444' }),
+    logger: silentLogger(),
+  });
+  mgr.heartbeat = async () => ({ ok: false, error: 'hub_unreachable_backoff', retryAfterMs: 5_000 });
+  // Only 5s left on the hub-unreachable window. The next tick must fire when
+  // the window elapses (~5s), not be padded out to a 30s floor.
+  mgr._hubUnreachableUntil = Date.now() + 5_000;
+  mgr._consecutiveFailures = 50; // generic branch would otherwise give the 15min cap
+
+  const realSetTimeout = global.setTimeout;
+  let observedDelay = null;
+  global.setTimeout = (fn, delay) => {
+    observedDelay = delay;
+    return realSetTimeout(() => {}, 0);
+  };
+  try {
+    mgr._running = true;
+    mgr._heartbeatInterval = 360_000;
+    await mgr._heartbeatTick();
+  } finally {
+    global.setTimeout = realSetTimeout;
+    mgr._running = false;
+    if (mgr._heartbeatTimer) clearTimeout(mgr._heartbeatTimer);
+  }
+
+  assert.ok(observedDelay >= 1_000 && observedDelay <= 6_000,
+    `expected ~5s remaining-window delay (1s floor, no 30s pad), got ${observedDelay}`);
 });
 
 test('pokeHeartbeatLoop is a no-op when loop is not running', () => {
