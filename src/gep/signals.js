@@ -32,6 +32,22 @@ function hasOpportunitySignal(signals) {
   return false;
 }
 
+// A cycle that produced no file/line changes is a no-op ("empty cycle"), not a
+// genuine failure -- even when its outcome is recorded as `failed`. The most
+// common way a `failed` event ends up with zero blast radius is a claimed-
+// success cycle rejected by the anti-forgery guard (`zero_blast_radius_with_
+// success`): the sub-agent declared success but touched nothing -- e.g. an
+// `innovate` gene that only produces metadata/strategy and never edits code.
+// Empty cycles are tracked separately (consecutiveEmptyCycles) and drive
+// graceful steady-state degradation, NOT the failure-loop ban. Single source of
+// truth so the empty/failure split stays consistent across every counter below.
+function _isEmptyCycle(evt) {
+  if (!evt) return false;
+  if (evt.meta && evt.meta.empty_cycle) return true;
+  var br = evt.blast_radius;
+  return !!(br && br.files === 0 && br.lines === 0);
+}
+
 // Build a de-duplication set from recent evolution events.
 // Returns an object: { suppressedSignals: Set<string>, recentIntents: string[], consecutiveRepairCount: number }
 function analyzeRecentHistory(recentEvents) {
@@ -85,13 +101,11 @@ function analyzeRecentHistory(recentEvents) {
 
   var recentIntents = recent.map(function(e) { return e.intent || 'unknown'; });
 
-  // Count empty cycles (blast_radius.files === 0) in last 8 events.
+  // Count empty cycles (no file/line changes) in last 8 events.
   // High ratio indicates the evolver is spinning without producing real changes.
   var emptyCycleCount = 0;
   for (var ec = 0; ec < tail.length; ec++) {
-    var br = tail[ec].blast_radius;
-    var em = tail[ec].meta && tail[ec].meta.empty_cycle;
-    if (em || (br && br.files === 0 && br.lines === 0)) {
+    if (_isEmptyCycle(tail[ec])) {
       emptyCycleCount++;
     }
   }
@@ -101,19 +115,25 @@ function analyzeRecentHistory(recentEvents) {
   // zero-change cycles. Used to trigger graceful degradation to steady-state mode.
   var consecutiveEmptyCycles = 0;
   for (var se = recent.length - 1; se >= 0; se--) {
-    var seBr = recent[se].blast_radius;
-    var seEm = recent[se].meta && recent[se].meta.empty_cycle;
-    if (seEm || (seBr && seBr.files === 0 && seBr.lines === 0)) {
+    if (_isEmptyCycle(recent[se])) {
       consecutiveEmptyCycles++;
     } else {
       break;
     }
   }
 
-  // Count consecutive failures at the tail of recent events.
+  // Count consecutive *productive* failures at the tail of recent events.
   // This tells the evolver "you have been failing N times in a row -- slow down."
+  //
+  // A no-op (zero-blast) cycle breaks the streak instead of extending it: it is
+  // already counted as an empty cycle above, which drives graceful steady-state
+  // degradation. Without this guard a gene that keeps producing empty cycles --
+  // or a sub-agent whose claimed-success cycles are anti-forgery-rejected to
+  // `failed` with zero blast radius -- would double-trigger failure_loop_detected
+  // + ban_gene and file a spurious recurring-failure GitHub issue (see #577).
   var consecutiveFailureCount = 0;
   for (var cf = recent.length - 1; cf >= 0; cf--) {
+    if (_isEmptyCycle(recent[cf])) break;
     var outcome = recent[cf].outcome;
     if (outcome && outcome.status === 'failed') {
       consecutiveFailureCount++;
@@ -122,9 +142,12 @@ function analyzeRecentHistory(recentEvents) {
     }
   }
 
-  // Count total failures in last 8 events (failure ratio).
+  // Count total *productive* failures in last 8 events (failure ratio).
+  // Empty (zero-blast) cycles are excluded for the same reason as the
+  // consecutive-failure streak above -- a no-op is saturation, not a failure.
   var recentFailureCount = 0;
   for (var rf = 0; rf < tail.length; rf++) {
+    if (_isEmptyCycle(tail[rf])) continue;
     var rfOut = tail[rf].outcome;
     if (rfOut && rfOut.status === 'failed') recentFailureCount++;
   }
@@ -727,4 +750,5 @@ module.exports = {
   OPPORTUNITY_SIGNALS, SIGNAL_PROFILES,
   _extractRegex, _extractKeywordScore, _extractLLM, _mergeSignals,
   _curlHubIpFamilyArgs, _curlHubIpFamilyAttempts, _curlAuthConfig,
+  _isEmptyCycle,
 };

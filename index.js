@@ -1,4 +1,150 @@
 #!/usr/bin/env node
+function _parseBootstrapSemver(version) {
+  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(String(version || ''));
+  if (!match) return null;
+  return {
+    major: match[1],
+    minor: match[2],
+    patch: match[3],
+    prerelease: match[4] ? match[4].split('.') : [],
+  };
+}
+
+function _compareBootstrapNumeric(left, right) {
+  if (left.length !== right.length) return left.length - right.length;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function _compareBootstrapPrerelease(left, right) {
+  const leftNumeric = /^\d+$/.test(left);
+  const rightNumeric = /^\d+$/.test(right);
+  if (leftNumeric && rightNumeric) return _compareBootstrapNumeric(left, right);
+  if (leftNumeric) return -1;
+  if (rightNumeric) return 1;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function _compareBootstrapSemver(left, right) {
+  const a = _parseBootstrapSemver(left);
+  const b = _parseBootstrapSemver(right);
+  if (!a || !b) return null;
+  for (const key of ['major', 'minor', 'patch']) {
+    const cmp = _compareBootstrapNumeric(a[key], b[key]);
+    if (cmp !== 0) return cmp;
+  }
+  if (!a.prerelease.length && !b.prerelease.length) return 0;
+  if (!a.prerelease.length) return 1;
+  if (!b.prerelease.length) return -1;
+  const max = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let i = 0; i < max; i++) {
+    if (a.prerelease[i] === undefined) return -1;
+    if (b.prerelease[i] === undefined) return 1;
+    const cmp = _compareBootstrapPrerelease(a.prerelease[i], b.prerelease[i]);
+    if (cmp !== 0) return cmp;
+  }
+  return 0;
+}
+
+function _bootstrapVersionSatisfies(currentVersion, requiredVersion) {
+  if (String(currentVersion || '') === String(requiredVersion || '')) return true;
+  const cmp = _compareBootstrapSemver(currentVersion, requiredVersion);
+  return cmp !== null && cmp >= 0;
+}
+
+function _failClosedForceUpdateBootstrap(backupName, entryName, error) {
+  const detail = error && error.message ? error.message : String(error || 'unknown error');
+  console.error('[ForceUpdate] Bootstrap recovery failed for ' + backupName +
+    (entryName ? ' while restoring ' + entryName : '') + ': ' + detail);
+  console.error('[ForceUpdate] Refusing to continue startup; recovery backup and journal were left in place.');
+  process.exit(1);
+}
+
+function _recoverInterruptedForceUpdateBootstrap() {
+  const fs = require('fs');
+  const path = require('path');
+  const installRoot = __dirname;
+  const backupPrefix = '.evolver-force-update-backup-';
+  const journalName = '.evolver-force-update-journal.json';
+  let backups = [];
+  try {
+    backups = fs.readdirSync(installRoot)
+      .filter((name) => name.startsWith(backupPrefix))
+      .sort()
+      .reverse();
+  } catch (_) {
+    return false;
+  }
+  for (const backupName of backups) {
+    const backupRoot = path.join(installRoot, backupName);
+    const journalPath = path.join(backupRoot, journalName);
+    let journal = null;
+    try {
+      journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    } catch (_) {
+      // Not a force-update recovery journal; leave unrelated directories alone.
+      continue;
+    }
+    if (!journal || journal.state !== 'precommit' || !journal.requiredVersion) continue;
+    let currentVersion = '';
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(installRoot, 'package.json'), 'utf8'));
+      currentVersion = pkg && pkg.version ? String(pkg.version) : '';
+    } catch (_) {
+      // If the package marker is unreadable, prefer restoring the old payload.
+    }
+    if (_bootstrapVersionSatisfies(currentVersion, String(journal.requiredVersion))) {
+      try { fs.rmSync(backupRoot, { recursive: true, force: true }); } catch (_) {
+        // Cleanup failure is non-fatal; normal startup can continue.
+      }
+      continue;
+    }
+    let entries = [];
+    try {
+      entries = fs.readdirSync(backupRoot, { withFileTypes: true });
+    } catch (readErr) {
+      _failClosedForceUpdateBootstrap(backupName, '', readErr);
+    }
+    for (const entry of entries) {
+      if (entry.name === journalName) continue;
+      const livePath = path.join(installRoot, entry.name);
+      const backupPath = path.join(backupRoot, entry.name);
+      try {
+        if (entry.name === 'index.js') {
+          const tmpPath = livePath + '.' + process.pid + '.recover-tmp';
+          try { fs.rmSync(tmpPath, { force: true }); } catch (_) {}
+          fs.copyFileSync(backupPath, tmpPath);
+          try {
+            const backupStat = fs.statSync(backupPath);
+            fs.chmodSync(tmpPath, backupStat.mode & 0o777);
+          } catch (_) {
+            // Recovery can proceed without mode restoration; npm/service launches
+            // normally use `node index.js` after an interrupted update.
+          }
+          fs.renameSync(tmpPath, livePath);
+          fs.rmSync(backupPath, { force: true });
+        } else {
+          fs.rmSync(livePath, { recursive: true, force: true });
+          fs.renameSync(backupPath, livePath);
+        }
+      } catch (restoreErr) {
+        _failClosedForceUpdateBootstrap(backupName, entry.name, restoreErr);
+      }
+    }
+    try { fs.rmSync(backupRoot, { recursive: true, force: true }); } catch (_) {
+      // Best-effort cleanup; recovery already restored the payload.
+    }
+    console.warn('[ForceUpdate] Recovered interrupted install from ' + backupName);
+    return true;
+  }
+  return false;
+}
+
+_recoverInterruptedForceUpdateBootstrap();
+
 function _printProxyTokenUsage(out = process.stderr) {
   out.write('Usage: node index.js proxy-token [--settings FILE]\n');
 }
@@ -105,7 +251,6 @@ const { solidify } = require('./src/gep/solidify');
 const path = require('path');
 const os = require('os');
 const { getRepoRoot } = require('./src/gep/paths');
-const { resolveLoopBridgeMode } = require('./src/evolve/loopBridgeMode');
 const fs = require('fs');
 const { spawn } = require('child_process');
 
@@ -253,14 +398,6 @@ function parseBoolEnv(v, fallback) {
   if (s === 'false' || s === '0' || s === 'off' || s === 'no') return false;
   if (s === 'true' || s === '1' || s === 'on' || s === 'yes') return true;
   return fallback;
-}
-
-function classifyInvocation(args) {
-  const argv = Array.isArray(args) ? args : [];
-  const command = argv[0];
-  const isLoop = argv.includes('--loop') || argv.includes('--mad-dog');
-  const startsEvolution = !command || command === 'run' || command === '/evolve' || isLoop;
-  return { command, isLoop, startsEvolution };
 }
 
 class CycleTimeoutError extends Error {
@@ -633,14 +770,13 @@ function refuseHelloIfDaemonRunning(toolLabel) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const invocation = classifyInvocation(args);
-  const command = invocation.command;
-  const isLoop = invocation.isLoop;
+  const command = args[0];
+  const isLoop = args.includes('--loop') || args.includes('--mad-dog');
   const isVerbose = args.includes('--verbose') || args.includes('-v') ||
     String(process.env.EVOLVER_VERBOSE || '').toLowerCase() === 'true';
   if (isVerbose) process.env.EVOLVER_VERBOSE = 'true';
 
-  if (invocation.startsEvolution) {
+  if (!command || command === 'run' || command === '/evolve' || isLoop) {
     if (isLoop) {
         // EPIPE protection. The daemon may outlive the controlling
         // terminal (user closes the iTerm tab, ssh session drops, parent
@@ -1107,9 +1243,21 @@ async function main() {
         // by default since v1.81.0): the daemon's changes get pushed to a
         // stash entry the user can recover with `git stash pop`.
         // Set EVOLVE_BRIDGE=false explicitly to opt back into observe-only.
-        const bridgeMode = resolveLoopBridgeMode(process.env);
-        console.log(`Loop mode enabled (internal daemon, bridge=${bridgeMode.value}, verbose=${isVerbose}).`);
-        for (const line of bridgeMode.banner) console.warn(line);
+        if (!process.env.EVOLVE_BRIDGE) {
+          process.env.EVOLVE_BRIDGE = 'true';
+        }
+        const bridgeEnabled = String(process.env.EVOLVE_BRIDGE).toLowerCase() !== 'false';
+        console.log(`Loop mode enabled (internal daemon, bridge=${process.env.EVOLVE_BRIDGE}, verbose=${isVerbose}).`);
+        if (bridgeEnabled) {
+          console.warn('[Daemon] EVOLVE_BRIDGE=true (default since v1.85.0).');
+          console.warn('[Daemon]   evolver may modify your working tree.');
+          console.warn('[Daemon]   Failed cycles auto-stash via "git stash push --include-untracked".');
+          console.warn('[Daemon]   Recover: git stash list | grep evolver-rollback');
+          console.warn('[Daemon]   Set EVOLVE_BRIDGE=false to opt out (observe-only mode).');
+        } else {
+          console.warn('[Daemon] EVOLVE_BRIDGE=false: evolver will NOT modify your working tree (observe-only).');
+          console.warn('[Daemon]   To enable real evolution: unset EVOLVE_BRIDGE or set it to "true".');
+        }
 
         // Startup diagnostic: in daemon mode evolver consumes its own stdout
         // instead of handing `sessions_spawn(...)` directives to a host
@@ -2714,8 +2862,9 @@ async function main() {
     // Wipe every local store of node_secret in one shot, so a daemon stuck
     // after a manual web reset (https://evomap.ai/account -> Reset Secret)
     // can boot clean. Local stores involved:
-    //   - MailboxStore: ~/.evomap/mailbox/state.json key node_secret + version
-    //   - Legacy files: ~/.evomap/node_secret and ~/.evomap/node_secret_version
+    //   - MailboxStore: ~/.evomap/mailbox/state.json node_secret state keys
+    //   - Legacy files: ~/.evomap/node_secret, node_secret_version,
+    //     node_secret_source, and node_secret_env_suppressed
     //   - Shell env:    A2A_NODE_SECRET / EVOMAP_NODE_SECRET and matching
     //                   version vars (we cannot mutate the parent shell; we
     //                   just print the unset hint)
@@ -2728,37 +2877,46 @@ async function main() {
     // this fallback, test/resetLocalSecret.test.js cannot inject a fake home
     // and the reset operates on the real user dir.
     const home = process.env.HOME || os.homedir();
-    const stateFile = path.join(home, '.evomap', 'mailbox', 'state.json');
-    const legacyFile = path.join(home, '.evomap', 'node_secret');
-    const legacyVersionFile = path.join(home, '.evomap', 'node_secret_version');
+    const evomapDirs = [];
+    const seenEvomapDirs = new Set();
+    const addEvomapDir = (dir) => {
+      if (!dir) return;
+      const resolved = path.resolve(dir);
+      if (seenEvomapDirs.has(resolved)) return;
+      seenEvomapDirs.add(resolved);
+      evomapDirs.push(dir);
+    };
+    addEvomapDir(path.join(home, '.evomap'));
+    addEvomapDir(process.env.EVOLVER_HOME);
     let cleared = 0;
     try {
-      if (fs.existsSync(stateFile)) {
-        const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-        let mutated = false;
-        for (const k of ['node_secret', 'node_secret_source', 'node_secret_version']) {
-          if (raw[k] !== undefined && raw[k] !== '') {
-            raw[k] = '';
-            mutated = true;
+      for (const evomapDir of evomapDirs) {
+        const stateFile = path.join(evomapDir, 'mailbox', 'state.json');
+        if (fs.existsSync(stateFile)) {
+          const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+          let mutated = false;
+          for (const k of ['node_secret', 'node_secret_source', 'node_secret_version', 'node_secret_env_suppressed']) {
+            if (raw[k] !== undefined && raw[k] !== '') {
+              raw[k] = '';
+              mutated = true;
+            }
+          }
+          if (mutated) {
+            fs.writeFileSync(stateFile, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+            cleared += 1;
+            console.log('[reset-local-secret] cleared MailboxStore at ' + stateFile);
+          } else {
+            console.log('[reset-local-secret] MailboxStore had no node_secret to clear at ' + stateFile);
           }
         }
-        if (mutated) {
-          fs.writeFileSync(stateFile, JSON.stringify(raw, null, 2) + '\n', 'utf8');
-          cleared += 1;
-          console.log('[reset-local-secret] cleared MailboxStore at ' + stateFile);
-        } else {
-          console.log('[reset-local-secret] MailboxStore had no node_secret to clear');
+        for (const legacyName of ['node_secret', 'node_secret_version', 'node_secret_source', 'node_secret_env_suppressed']) {
+          const legacyFile = path.join(evomapDir, legacyName);
+          if (fs.existsSync(legacyFile)) {
+            fs.unlinkSync(legacyFile);
+            cleared += 1;
+            console.log('[reset-local-secret] removed legacy file ' + legacyFile);
+          }
         }
-      }
-      if (fs.existsSync(legacyFile)) {
-        fs.unlinkSync(legacyFile);
-        cleared += 1;
-        console.log('[reset-local-secret] removed legacy file ' + legacyFile);
-      }
-      if (fs.existsSync(legacyVersionFile)) {
-        fs.unlinkSync(legacyVersionFile);
-        cleared += 1;
-        console.log('[reset-local-secret] removed legacy file ' + legacyVersionFile);
       }
     } catch (err) {
       console.error('[reset-local-secret] error:', err && err.message || err);
@@ -2870,6 +3028,35 @@ async function main() {
       process.exit(res && typeof res.exitCode === 'number' ? res.exitCode : 0);
     } catch (atpCliErr) {
       console.error('[ATP] CLI error:', atpCliErr && atpCliErr.message || atpCliErr);
+      process.exit(1);
+    }
+
+  } else if (command === 'reuse') {
+    try {
+      const { runReuseCommand } = require('./src/gep/cliContracts');
+      process.exit(await runReuseCommand(args.slice(1)));
+    } catch (e) {
+      process.stdout.write(JSON.stringify({
+        ok: false,
+        contract: 'reuse.v1',
+        reason: 'internal_error',
+        message: 'evolver reuse failed',
+      }) + '\n');
+      process.exit(1);
+    }
+
+  } else if (command === 'publish') {
+    try {
+      const { runPublishCommand } = require('./src/gep/cliContracts');
+      process.exit(await runPublishCommand(args.slice(1)));
+    } catch (e) {
+      process.stdout.write(JSON.stringify({
+        ok: false,
+        contract: 'publish.v1',
+        reason: 'internal_error',
+        retryable: false,
+        message: 'evolver publish failed',
+      }) + '\n');
       process.exit(1);
     }
 
@@ -3040,7 +3227,7 @@ async function main() {
     }
 
   } else {
-    console.log(`Usage: node index.js [run|/evolve|login|logout|proxy-token|solidify|review|distill|fetch|sync|asset-log|webui|setup-hooks|recipe|buy|orders|verify|atp|atp-complete|experiment] [--loop]
+    console.log(`Usage: node index.js [run|/evolve|login|logout|proxy-token|solidify|review|distill|fetch|sync|asset-log|webui|setup-hooks|reuse|publish|recipe|buy|orders|verify|atp|atp-complete|experiment] [--loop]
   - login                      (authorize this device via the hub, gh-auth-login style; stores an OAuth token used instead of node_secret)
   - logout                     (remove the stored OAuth token)
   - proxy-token                (print the local proxy bearer token for command-backed client auth)
@@ -3052,6 +3239,11 @@ async function main() {
     - build --title="..." --genes=<asset_id,...> [--description] [--price=N] [--publish]
                               (builds a DRAFT DNA blueprint; --publish is opt-in)
     - reuse --id=<recipe_id> [--input=<json>]   (express a recipe into an organism)
+  - reuse flags:
+    - --id=<asset_id> --json     (reuse a Hub asset into the local library; stdout JSON contract reuse.v1)
+  - publish flags:
+    - --asset=<id|path> [--asset ...] [--dry-run] --json
+                              (publish.v1 stdout JSON contract for Desktop)
   - fetch flags:
     - --skill=<id> | -s <id>   (skill ID to download)
     - --out=<dir>              (output directory, default: ./skills/<skill_id>)
@@ -3134,8 +3326,6 @@ module.exports = {
   rejectPendingRun,
   isPendingSolidify,
   parseBoolEnv,
-  classifyInvocation,
-  resolveLoopBridgeMode,
   CycleTimeoutError,
   writeCycleProgressAtomic,
   spawnReplacementProcess,

@@ -31,7 +31,7 @@ require.cache[lifecyclePath] = {
 };
 
 const { SyncEngine } = require('../src/proxy/sync/engine');
-const { InboundSync } = require('../src/proxy/sync/inbound');
+const { InboundSync, DEFAULT_POLL_INTERVAL_ACTIVE } = require('../src/proxy/sync/inbound');
 const { OutboundSync } = require('../src/proxy/sync/outbound');
 const hubFetchMod = require('../src/gep/hubFetch');
 
@@ -81,6 +81,32 @@ function makeTextResponse(status, contentType, body) {
     headers: new Headers({ 'content-type': contentType }),
     text: async () => body,
   };
+}
+
+function sensitiveHubBody() {
+  return {
+    raw: {
+      nodeSecret: 'f'.repeat(64),
+      bearer: 'Bearer ' + 'g'.repeat(64),
+      token: 'tok_' + 'h'.repeat(40),
+      envPath: '.env.local',
+    },
+    json() {
+      return JSON.stringify({
+        error: 'node_secret_invalid',
+        node_secret: this.raw.nodeSecret,
+        token: this.raw.token,
+        detail: `${this.raw.bearer} from ${this.raw.envPath}`,
+      });
+    },
+  };
+}
+
+function assertNoRawHubBodySecrets(text, raw) {
+  assert.equal(text.includes(raw.nodeSecret), false, 'raw node_secret value must not be surfaced');
+  assert.equal(text.includes(raw.bearer), false, 'raw Bearer token must not be surfaced');
+  assert.equal(text.includes(raw.token), false, 'raw token field value must not be surfaced');
+  assert.equal(text.includes(raw.envPath), false, 'raw .env path must not be surfaced');
 }
 
 async function runOneScheduledTick(schedule) {
@@ -157,6 +183,39 @@ describe('SyncEngine outbound loop resilience', () => {
     assert.ok(sawMultipleFlushes,
       'flush must keep being called after a throw — loop must NOT silently die. flushCalls=' + flushCalls);
     assert.ok(engine._outTimer, 'outbound timer must remain armed after a flush throw');
+  });
+
+  it('outbound AuthError invokes lifecycle reAuthenticate callback', async () => {
+    let reauthCalls = 0;
+    const lifecycle = {
+      reAuthenticate: async () => {
+        reauthCalls++;
+        return false;
+      },
+    };
+    const logger = makeQuietLogger();
+
+    engine = new SyncEngine({
+      store: makeStore(),
+      hubUrl: 'https://hub.example/test',
+      getHeaders: () => ({}),
+      logger,
+      onAuthError: () => lifecycle.reAuthenticate(),
+    });
+    engine.outbound = {
+      flush: async () => {
+        throw new AuthError('Hub 401: {"error":"node_secret_invalid"}');
+      },
+    };
+    engine.inbound = { pull: async () => ({ received: 0 }), ackDelivered: async () => {} };
+    engine._running = true;
+
+    const delays = await runOneScheduledTick(() => engine._scheduleOutbound(0));
+
+    assert.equal(reauthCalls, 1, 'sync AuthError must enter lifecycle reAuthenticate');
+    assert.match(logger._errors.join('\n'), /auth error from outbound/);
+    assert.equal(delays[0], 0);
+    assert.equal(delays[1], 1_000, 'outbound loop should continue after auth handling');
   });
 
   it('store.countPending throwing does NOT park the loop (the #544 pattern in sync engine)', async () => {
@@ -262,6 +321,42 @@ describe('SyncEngine inbound loop resilience', () => {
     assert.ok(engine._inTimer, 'inbound timer must be RE-ARMED after a pull throw');
     assert.notEqual(engine._inTimer, initialInTimer,
       'a new timer must have been created (the rescheduled one), not the original');
+  });
+
+  it('inbound AuthError invokes lifecycle reAuthenticate callback', async () => {
+    let reauthCalls = 0;
+    const lifecycle = {
+      reAuthenticate: async () => {
+        reauthCalls++;
+        return false;
+      },
+    };
+    const logger = makeQuietLogger();
+
+    engine = new SyncEngine({
+      store: makeStore(),
+      hubUrl: 'https://hub.example/test',
+      getHeaders: () => ({}),
+      logger,
+      onAuthError: () => lifecycle.reAuthenticate(),
+    });
+    engine.outbound = { flush: async () => ({ sent: 0 }) };
+    engine.inbound = {
+      pull: async () => {
+        throw new AuthError('Hub 403: {"error":"node_secret_invalid"}');
+      },
+      ackDelivered: async () => {
+        throw new Error('ack should not run after inbound auth failure');
+      },
+    };
+    engine._running = true;
+
+    const delays = await runOneScheduledTick(() => engine._scheduleInbound(0));
+
+    assert.equal(reauthCalls, 1, 'inbound AuthError must enter lifecycle reAuthenticate');
+    assert.match(logger._errors.join('\n'), /auth error from inbound/);
+    assert.equal(delays[0], 0);
+    assert.equal(delays[1], DEFAULT_POLL_INTERVAL_ACTIVE, 'inbound loop should continue after auth handling');
   });
 
   it('onInboundReceived callback throwing does NOT park the loop', async () => {
@@ -407,6 +502,66 @@ describe('SyncEngine Hub non-API response backoff', () => {
     assert.equal(result.error, 'hub_unreachable');
     assert.ok(result.retryAfterMs >= 60_000);
     assert.deepEqual(logger._errors, []);
+  });
+
+  it('InboundSync redacts JSON auth response bodies before surfacing AuthError', async () => {
+    const body = sensitiveHubBody();
+    hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+      403,
+      'application/json',
+      body.json(),
+    ));
+    const inbound = new InboundSync({
+      store: makeMailboxStore(),
+      hubUrl: 'https://hub.example',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+
+    await assert.rejects(
+      () => inbound.pull(),
+      (err) => {
+        assert.equal(err.name, 'AuthError');
+        assert.match(err.message, /"node_secret":"\[REDACTED\]"/);
+        assertNoRawHubBodySecrets(err.message, body.raw);
+        return true;
+      },
+    );
+  });
+
+  it('OutboundSync redacts JSON auth response bodies before surfacing AuthError', async () => {
+    const body = sensitiveHubBody();
+    hubFetchMod._setFetchImplForTest(async () => makeTextResponse(
+      401,
+      'application/json',
+      body.json(),
+    ));
+    const outbound = new OutboundSync({
+      store: makeMailboxStore({
+        pollOutbound: () => [{
+          id: 'msg_1',
+          type: 'asset_submit',
+          payload: { ok: true },
+          priority: 'normal',
+          ref_id: null,
+          created_at: new Date().toISOString(),
+          retry_count: 0,
+        }],
+      }),
+      hubUrl: 'https://hub.example',
+      getHeaders: () => ({}),
+      logger: makeQuietLogger(),
+    });
+
+    await assert.rejects(
+      () => outbound.flush(),
+      (err) => {
+        assert.equal(err.name, 'AuthError');
+        assert.match(err.message, /"node_secret":"\[REDACTED\]"/);
+        assertNoRawHubBodySecrets(err.message, body.raw);
+        return true;
+      },
+    );
   });
 
   it('OutboundSync does not increment retry counters for HTML 504 hub outages', async () => {

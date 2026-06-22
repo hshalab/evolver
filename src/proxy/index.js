@@ -19,7 +19,7 @@ const { DmHandler } = require('./extensions/dmHandler');
 const { SessionHandler } = require('./extensions/sessionHandler');
 const { TraceControl } = require('./extensions/traceControl');
 const { backfillProxyTraceUploads } = require('./trace/extractor');
-const { hubFetch } = require('../gep/hubFetch');
+const { hubFetch, sanitizeHubResponseForLog } = require('../gep/hubFetch');
 
 const TRACE_BACKFILL_DRAIN_MAX_PASSES = 8;
 const TRACE_BACKFILL_STARTUP_DRAIN_MAX_MS = 250;
@@ -562,17 +562,17 @@ class EvoMapProxy {
         const retry = await hubFetch(endpoint, retryInit);
         if (!retry.ok) {
           const text = await retry.text().catch(() => '');
-          throw Object.assign(new Error(`Hub ${retry.status}: ${text}`), { statusCode: retry.status });
+          throw Object.assign(new Error(`Hub ${retry.status}: ${sanitizeHubResponseForLog(text)}`), { statusCode: retry.status });
         }
         return retry.json();
       }
       const text = await res.text().catch(() => '');
-      throw Object.assign(new Error(`Hub ${res.status} (re-auth failed): ${text}`), { statusCode: res.status });
+      throw Object.assign(new Error(`Hub ${res.status} (re-auth failed): ${sanitizeHubResponseForLog(text)}`), { statusCode: res.status });
     }
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      const err = Object.assign(new Error(`Hub ${res.status}: ${text}`), { statusCode: res.status });
+      const err = Object.assign(new Error(`Hub ${res.status}: ${sanitizeHubResponseForLog(text)}`), { statusCode: res.status });
       if (res.status === 429) err.retryAfterMs = parseRetryAfterMs(res, text);
       throw err;
     }

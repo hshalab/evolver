@@ -9,6 +9,7 @@ const {
   isHubUnreachableError,
   readHubResponseJson,
   readHubResponseText,
+  sanitizeHubResponseForLog,
   throwIfHubUnreachableResponse,
 } = require('../../gep/hubFetch');
 
@@ -75,12 +76,12 @@ class InboundSync {
 
       if (res.status === 403 || res.status === 401) {
         const errText = await readHubResponseText(res).catch(() => 'unknown');
-        throw new AuthError(`Hub ${res.status}: ${errText}`, res.status);
+        throw new AuthError(`Hub ${res.status}: ${sanitizeHubResponseForLog(errText)}`, res.status);
       }
 
       if (!res.ok) {
         const errText = await readHubResponseText(res).catch(() => 'unknown');
-        throw new Error(`Hub returned ${res.status}: ${errText}`);
+        throw new Error(`Hub returned ${res.status}: ${sanitizeHubResponseForLog(errText)}`);
       }
 
       const data = await readHubResponseJson(res);
@@ -163,11 +164,11 @@ class InboundSync {
       this._recordHubReachable();
       if (res.status === 403 || res.status === 401) {
         const errText = await readHubResponseText(res).catch(() => 'unknown');
-        throw new AuthError(`Hub ${res.status}: ${errText}`, res.status);
+        throw new AuthError(`Hub ${res.status}: ${sanitizeHubResponseForLog(errText)}`, res.status);
       }
       if (!res.ok) {
         const errText = await readHubResponseText(res).catch(() => 'unknown');
-        throw new Error(`Hub returned ${res.status}: ${errText}`);
+        throw new Error(`Hub returned ${res.status}: ${sanitizeHubResponseForLog(errText)}`);
       }
       await drainHubResponse(res);
       return { acked: delivered.length };
